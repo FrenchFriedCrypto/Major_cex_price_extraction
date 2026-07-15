@@ -1,0 +1,48 @@
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+
+# Python environments, caches, and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local tooling metadata and runtime state
+.agents/
+.bybit_rate_limit_state
+*.log
+symbol_first_candle_cache.json
+symbol_first_candle_cache.json.tmp
+
+# Retrieved exchange symbol universes and delisting records
+/Symbols/
+
+# Retrieved market/API data
+/data/
+/massiv_api/data/*
+!/massiv_api/data/.gitkeep
+/options/*.db
+/options/*_streams.csv
+
+# Output folders used by legacy exchange downloaders
+*_btse/
+*_bydfi/
+*_coincatch/
+*_deepcoin/
+*_htx/
+*_kucoin/
+*_orangex/
+*_toobit/
+*_whitebit/
+*_xt/
+b_USDT*/
+m_USDT*/
