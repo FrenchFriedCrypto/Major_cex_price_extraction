@@ -20,6 +20,9 @@ if str(ROOT) not in sys.path:
 FUTURES_DIR = ROOT / "get_futures_data"
 if str(FUTURES_DIR) not in sys.path:
     sys.path.insert(0, str(FUTURES_DIR))
+FUTURES_SYMBOLS_DIR = ROOT / "get_futures_symbols"
+if str(FUTURES_SYMBOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(FUTURES_SYMBOLS_DIR))
 
 
 def load_module(name: str, path: Path):
@@ -31,7 +34,7 @@ def load_module(name: str, path: Path):
 
 
 futures_common = load_module("quiet_test_futures_common", ROOT / "get_futures_data" / "futures_common.py")
-usdt_common = load_module("quiet_test_usdt_common", ROOT / "get_USDT_symbols" / "usdt_common.py")
+usdt_common = load_module("quiet_test_usdt_common", ROOT / "get_futures_symbols" / "usdt_common.py")
 
 
 def reset_workspace_dir(name: str) -> Path:
@@ -747,7 +750,10 @@ class FuturesQuietOutputTests(unittest.TestCase):
     def test_binance_get_symbols_appends_new_and_delisted_symbols(self):
         symbols_dir = reset_workspace_dir("_binance_symbols")
         csv_path = symbols_dir / "binance_symbols.csv"
-        binance_module = load_module("quiet_test_root_binance_usdt", ROOT / "00_usdt_binance.py")
+        binance_module = load_module(
+            "quiet_test_root_binance_usdt",
+            ROOT / "get_futures_symbols" / "00_usdt_binance.py",
+        )
         payload = {
             "symbols": [
                 {
@@ -795,7 +801,7 @@ class FuturesQuietOutputTests(unittest.TestCase):
         self.assertEqual(delisted_rows, [["OLDUSDT"]])
 
     def test_active_usdt_scripts_use_shared_symbol_file_update_helper(self):
-        script_dir = ROOT / "get_USDT_symbols"
+        script_dir = ROOT / "get_futures_symbols"
         script_paths = sorted(script_dir.glob("00_usdt_*.py"))
         self.assertTrue(script_paths)
 

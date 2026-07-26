@@ -1,7 +1,8 @@
 import csv
+import os
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import requests
 
@@ -289,3 +290,59 @@ def update_symbol_files(
         write_symbols(csv_filename, filtered_symbols, preserve_case=preserve_case)
     else:
         append_new_symbols(csv_filename, filtered_symbols, preserve_case=preserve_case)
+
+
+def update_symbol_listing_metadata(
+    csv_filename: str,
+    listing_times_ms: Mapping[object, object],
+    *,
+    preserve_case: bool = False,
+) -> None:
+    """Persist only exchange-supplied listing timestamps in a separate CSV."""
+    SYMBOLS_DIR.mkdir(parents=True, exist_ok=True)
+    source = Path(csv_filename)
+    metadata_path = SYMBOLS_DIR / f"{source.stem}_metadata.csv"
+
+    merged: dict[str, int] = {}
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", newline="", encoding="utf-8-sig") as metadata_file:
+                for row in csv.DictReader(metadata_file):
+                    raw_symbol = str(row.get("Symbol") or "").strip()
+                    raw_time = str(row.get("Listing time ms") or "").strip()
+                    try:
+                        listing_time_ms = int(raw_time)
+                    except ValueError:
+                        continue
+                    if raw_symbol and listing_time_ms >= 0:
+                        key = raw_symbol if preserve_case else raw_symbol.upper()
+                        merged[key] = listing_time_ms
+        except OSError as exc:
+            print(f"[WARN] Could not read {metadata_path}: {exc}")
+
+    for raw_symbol, raw_time in listing_times_ms.items():
+        symbol_text = str(raw_symbol).strip()
+        if not symbol_text:
+            continue
+        try:
+            listing_time_ms = int(str(raw_time).strip())
+        except (TypeError, ValueError):
+            continue
+        if listing_time_ms < 0:
+            continue
+        key = symbol_text if preserve_case else symbol_text.upper()
+        merged[key] = listing_time_ms
+
+    if not merged:
+        return
+
+    tmp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", newline="", encoding="utf-8") as metadata_file:
+            writer = csv.writer(metadata_file)
+            writer.writerow(["Symbol", "Listing time ms"])
+            for symbol, listing_time_ms in sorted(merged.items()):
+                writer.writerow([symbol, listing_time_ms])
+        os.replace(tmp_path, metadata_path)
+    except OSError as exc:
+        print(f"[ERROR] Error writing listing metadata to {metadata_path}: {exc}")

@@ -20,19 +20,28 @@ for import_path in (PROJECT_ROOT, GET_FUTURES_DIR):
 
 from get_futures_data.futures_common import (  # noqa: E402
     DEFAULT_START_DT,
+    FUTURES_DATA_DIR,
     INTERVAL_MS,
     OUTPUT_COLUMNS,
     SLEEP_BETWEEN_CALLS,
+    DuckDBPriceWriter,
+    FetchResult,
+    FetchWindowError,
+    RequestResult,
+    RequestStatus,
+    coerce_fetch_result,
     dt_to_ms,
+    fetch_result_from_request_failure,
     get_output_folder,
     load_delisted_symbols,
     ms_to_utc_string,
     request_json,
+    request_json_outcome,
     utc_now_ms,
 )
 
 
-FetchRows = Callable[[str, int, int], Sequence[Sequence[Any]] | None]
+FetchRows = Callable[[str, int, int], Sequence[Sequence[Any]] | FetchResult | None]
 
 
 def read_symbol_csv(csv_path: Path) -> pd.DataFrame:
@@ -253,13 +262,33 @@ def fetch_missing_range(
             break
 
         try:
-            raw_rows = fetch_rows(symbol, cursor, window_end) or []
+            fetch_result = coerce_fetch_result(fetch_rows(symbol, cursor, window_end))
         except Exception as exc:
-            print(
-                f"[WARN] Failed window for {symbol} {interval} "
-                f"{ms_to_utc_string(cursor)}..{ms_to_utc_string(window_end)}: {exc}"
+            raise FetchWindowError(
+                FetchResult.retryable_failure(
+                    f"{symbol} {interval} "
+                    f"{ms_to_utc_string(cursor)}..{ms_to_utc_string(window_end)}: {exc}"
+                )
+            ) from exc
+
+        if not fetch_result.succeeded:
+            raise FetchWindowError(fetch_result)
+
+        raw_rows = fetch_result.rows
+        malformed_row = next(
+            (
+                row
+                for row in raw_rows
+                if len(row) < 6 or _coerce_open_ms(row[0]) is None
+            ),
+            None,
+        )
+        if malformed_row is not None:
+            raise FetchWindowError(
+                FetchResult.terminal_failure(
+                    f"malformed row for {symbol} {interval}: {malformed_row!r}"
+                )
             )
-            raw_rows = []
 
         if raw_rows:
             provider_returned_rows = True
@@ -385,6 +414,113 @@ def reconcile_symbol_csv(
         atomic_write_csv(csv_path, final_df)
         return True
     return False
+
+
+def reconcile_database(
+    database_path: Path,
+    *,
+    interval: str,
+    fetch_rows: FetchRows,
+    batch_candles: int,
+    end_lag_ms: int = 0,
+    min_start_ms: int | None = None,
+    write_queue_size: int = 32,
+) -> int:
+    """Repair internal gaps in one existing timeframe DuckDB database."""
+    if not database_path.exists():
+        return 0
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"unsupported interval {interval!r}")
+
+    interval_ms = INTERVAL_MS[interval]
+    complete_before = complete_before_ms(end_lag_ms)
+    inserted_batches = 0
+
+    with DuckDBPriceWriter(
+        database_path,
+        queue_size=write_queue_size,
+        migrate_legacy=False,
+    ) as writer:
+        by_symbol = writer.symbols_and_open_times(
+            interval_ms=interval_ms,
+            complete_before_ms=complete_before,
+        )
+        for symbol, open_times in by_symbol.items():
+            gaps = detect_gaps(open_times, interval_ms)
+            symbol_failed = False
+            for gap_start_ms, gap_end_ms in gaps:
+                request_start_ms = gap_start_ms
+                if min_start_ms is not None:
+                    request_start_ms = max(request_start_ms, min_start_ms)
+                if request_start_ms >= gap_end_ms:
+                    continue
+
+                try:
+                    fetched = fetch_missing_range(
+                        symbol,
+                        interval,
+                        request_start_ms,
+                        gap_end_ms,
+                        fetch_rows,
+                        batch_candles=batch_candles,
+                        complete_before=complete_before,
+                        min_start_ms=min_start_ms,
+                        sleep_between_calls=0,
+                    )
+                except FetchWindowError as exc:
+                    result = exc.result
+                    print(
+                        f"[WARN] Deferred reconciliation window for {symbol} {interval} "
+                        f"{ms_to_utc_string(gap_start_ms)}..{ms_to_utc_string(gap_end_ms)} "
+                        f"({result.status.value}): {result.message}"
+                    )
+                    symbol_failed = True
+                    break
+
+                if fetched.empty:
+                    continue
+                writer.insert_output_rows(
+                    symbol,
+                    fetched[OUTPUT_COLUMNS].itertuples(index=False, name=None),
+                )
+                inserted_batches += 1
+
+            if symbol_failed:
+                continue
+
+    return inserted_batches
+
+
+def reconcile_existing_databases(
+    *,
+    exchange: str,
+    intervals: Mapping[str, Any],
+    make_fetch_rows: Callable[[str, Any], FetchRows],
+    batch_candles: int | Callable[[str, Any], int],
+    min_start_ms: int | Callable[[str, Any], int | None] | None = None,
+    end_lag_ms: int | Callable[[str, Any], int] = 0,
+    write_queue_size: int = 32,
+) -> None:
+    exchange_dir = FUTURES_DATA_DIR / exchange.lower()
+    if not exchange_dir.exists():
+        return
+
+    for interval, api_interval in intervals.items():
+        database_path = exchange_dir / f"{interval}.duckdb"
+        if not database_path.exists():
+            continue
+        try:
+            reconcile_database(
+                database_path,
+                interval=interval,
+                fetch_rows=make_fetch_rows(interval, api_interval),
+                batch_candles=int(_value_for_interval(batch_candles, interval, api_interval)),
+                min_start_ms=_value_for_interval(min_start_ms, interval, api_interval),
+                end_lag_ms=int(_value_for_interval(end_lag_ms, interval, api_interval) or 0),
+                write_queue_size=write_queue_size,
+            )
+        except Exception as exc:
+            print(f"[ERROR] {exchange} @ {interval}: {exc}")
 
 
 def _value_for_interval(value_or_func: Any, interval: str, api_interval: Any) -> Any:

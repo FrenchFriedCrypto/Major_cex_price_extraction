@@ -82,10 +82,10 @@ class BitgetRequestWindowTests(unittest.TestCase):
 
         self.assertEqual(process_calls[0][1]["batch_candles"], 11)
         self.assertEqual(process_calls[0][0][2], bitget.EXCHANGE)
-        self.assertEqual(process_calls[0][1]["sleep_between_calls"], bitget.BITGET_SLEEP_BETWEEN_CALLS)
+        self.assertNotIn("sleep_between_calls", process_calls[0][1])
         self.assertEqual(process_calls[0][1]["start_dt"], datetime(2023, 1, 2, tzinfo=timezone.utc))
         self.assertEqual(process_calls[1][1]["batch_candles"], 2)
-        self.assertEqual(process_calls[1][1]["sleep_between_calls"], bitget.BITGET_SLEEP_BETWEEN_CALLS)
+        self.assertNotIn("sleep_between_calls", process_calls[1][1])
         self.assertEqual(process_calls[1][1]["start_dt"], datetime(2023, 1, 1, tzinfo=timezone.utc))
 
 

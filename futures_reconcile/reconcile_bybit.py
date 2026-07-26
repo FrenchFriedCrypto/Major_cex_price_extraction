@@ -1,12 +1,35 @@
 from __future__ import annotations
 
-import os
 import time
 
 try:
-    from .reconcile_common import PROJECT_ROOT, reconcile_existing_csvs, request_json
+    from .reconcile_common import (
+        PROJECT_ROOT,
+        FetchResult,
+        RequestResult,
+        RequestStatus,
+        fetch_result_from_request_failure,
+        reconcile_existing_databases,
+        request_json,
+        request_json_outcome,
+    )
 except ImportError:
-    from reconcile_common import PROJECT_ROOT, reconcile_existing_csvs, request_json  # type: ignore
+    from reconcile_common import (  # type: ignore
+        PROJECT_ROOT,
+        FetchResult,
+        RequestResult,
+        RequestStatus,
+        fetch_result_from_request_failure,
+        reconcile_existing_databases,
+        request_json,
+        request_json_outcome,
+    )
+
+from get_futures_data.futures_rate_limit import (
+    BYBIT_REQUESTS_PER_SECOND,
+    CrossProcessRollingRateLimiter,
+    get_exchange_rate_limiter,
+)
 
 
 STATE_FILE = PROJECT_ROOT / ".bybit_rate_limit_state"
@@ -31,86 +54,71 @@ INTERVALS = {
 }
 KLINE_LIMIT = 1000
 RATE_LIMIT_RETCODE = 10006
-MIN_REQUEST_INTERVAL_SECONDS = 0.25
-LOCK_POLL_SECONDS = 0.02
-LOCK_STALE_SECONDS = 30
+BYBIT_RATE_LIMIT_PER_SECOND = BYBIT_REQUESTS_PER_SECOND
+MIN_REQUEST_INTERVAL_SECONDS = 1 / BYBIT_RATE_LIMIT_PER_SECOND
 BYBIT_MAX_RATE_LIMIT_RETRIES = 8
 BYBIT_RATE_LIMIT_RETRY_SLEEP_SECONDS = 1.0
-
-
-class _FileLock:
-    def __init__(self, lock_path) -> None:
-        self.lock_path = lock_path
-        self.fd: int | None = None
-
-    def __enter__(self) -> "_FileLock":
-        while True:
-            try:
-                self.fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self.fd, str(os.getpid()).encode("ascii"))
-                return self
-            except FileExistsError:
-                self._remove_stale_lock()
-                time.sleep(LOCK_POLL_SECONDS)
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-        try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
-
-    def _remove_stale_lock(self) -> None:
-        try:
-            age = time.time() - self.lock_path.stat().st_mtime
-        except FileNotFoundError:
-            return
-        if age <= LOCK_STALE_SECONDS:
-            return
-        try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+BYBIT_RATE_LIMITER = get_exchange_rate_limiter(EXCHANGE)
 
 
 def is_bybit_rate_limit_response(data: object) -> bool:
     return isinstance(data, dict) and data.get("retCode") == RATE_LIMIT_RETCODE
 
 
-def wait_for_bybit_slot(min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    with _FileLock(LOCK_FILE):
-        last_request_at = _read_last_request_at()
-        now = time.monotonic()
-        if last_request_at is not None:
-            wait_seconds = min_interval_seconds - (now - last_request_at)
-            if wait_seconds > 0:
-                time.sleep(wait_seconds)
-                now = time.monotonic()
-        STATE_FILE.write_text(f"{now:.9f}", encoding="ascii")
-
-
-def _read_last_request_at() -> float | None:
-    try:
-        value = STATE_FILE.read_text(encoding="ascii").strip()
-    except FileNotFoundError:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
+def wait_for_bybit_slot(min_interval_seconds: float | None = None) -> None:
+    if min_interval_seconds is None:
+        BYBIT_RATE_LIMITER.acquire()
+        return
+    compatibility_limiter = CrossProcessRollingRateLimiter(
+        STATE_FILE,
+        1,
+        min_interval_seconds,
+        clock=time.monotonic,
+        sleeper=time.sleep,
+    )
+    compatibility_limiter.acquire()
 
 
-def request_bybit_kline(symbol: str, params: dict) -> object | None:
-    data = None
+_ORIGINAL_REQUEST_JSON = request_json
+
+
+def request_bybit_kline(
+    symbol: str,
+    params: dict,
+    *,
+    sleeper=None,
+    wall_clock=None,
+    rate_limiter=None,
+) -> RequestResult:
+    last_result = RequestResult(
+        RequestStatus.RETRYABLE_FAILURE,
+        message=f"Bybit request did not run for {symbol}",
+    )
     for attempt in range(1, BYBIT_MAX_RATE_LIMIT_RETRIES + 1):
-        wait_for_bybit_slot()
-        data = request_json(KLINE_URL, params=params)
+        if request_json is not _ORIGINAL_REQUEST_JSON:
+            wait_for_bybit_slot()
+        request_options = {"params": params}
+        if sleeper is not None:
+            request_options["sleep_func"] = sleeper
+        if wall_clock is not None:
+            request_options["wall_clock"] = wall_clock
+        if rate_limiter is None and (sleeper is not None or wall_clock is not None):
+            rate_limiter = CrossProcessRollingRateLimiter(
+                BYBIT_RATE_LIMITER.state_path,
+                BYBIT_RATE_LIMITER.capacity,
+                BYBIT_RATE_LIMITER.window_seconds,
+                clock=wall_clock or time.time,
+                sleeper=sleeper or time.sleep,
+            )
+        if rate_limiter is not None:
+            request_options["rate_limiter"] = rate_limiter
+            request_options["use_inferred_rate_limiter"] = False
+        last_result = request_json_outcome(request_json, KLINE_URL, **request_options)
+        if not last_result.succeeded:
+            return last_result
+        data = last_result.value
         if not is_bybit_rate_limit_response(data):
-            return data
+            return last_result
 
         delay_seconds = BYBIT_RATE_LIMIT_RETRY_SLEEP_SECONDS * attempt
         if attempt < BYBIT_MAX_RATE_LIMIT_RETRIES:
@@ -118,17 +126,21 @@ def request_bybit_kline(symbol: str, params: dict) -> object | None:
                 f"[RETRY] Bybit rate limit for {symbol}. Attempt "
                 f"{attempt}/{BYBIT_MAX_RATE_LIMIT_RETRIES}; sleeping {delay_seconds:g}s."
             )
-            time.sleep(delay_seconds)
+            (sleeper or time.sleep)(delay_seconds)
         else:
             print(
                 f"[ERROR] Bybit rate limit persisted for {symbol} "
                 f"after {BYBIT_MAX_RATE_LIMIT_RETRIES} attempts."
             )
 
-    return data
+    return RequestResult(
+        RequestStatus.RETRYABLE_FAILURE,
+        value=last_result.value,
+        message=f"Bybit rate limit persisted for {symbol}",
+    )
 
 
-def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> list[list[object]]:
+def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> FetchResult:
     params = {
         "category": "linear",
         "symbol": symbol,
@@ -137,27 +149,31 @@ def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> 
         "end": end_ms,
         "limit": KLINE_LIMIT,
     }
-    data = request_bybit_kline(symbol, params)
+    request_result = request_bybit_kline(symbol, params)
+    if not request_result.succeeded:
+        return fetch_result_from_request_failure(request_result, context=f"Bybit {symbol}")
+    data = request_result.value
     if not isinstance(data, dict):
-        return []
+        return FetchResult.terminal_failure(f"Unexpected Bybit response for {symbol}: {data!r}")
     if data.get("retCode") != 0:
-        print(f"Bybit API error for {symbol}: {data.get('retCode')} {data.get('retMsg')}")
-        return []
+        return FetchResult.terminal_failure(
+            f"Bybit API error for {symbol}: {data.get('retCode')} {data.get('retMsg')}"
+        )
 
     result = data.get("result", {})
-    klines = result.get("list", []) if isinstance(result, dict) else []
+    if not isinstance(result, dict) or not isinstance(result.get("list", []), list):
+        return FetchResult.terminal_failure(f"Unexpected Bybit kline format for {symbol}.")
     rows = []
-    for item in klines:
+    for item in result.get("list", []):
         if not isinstance(item, list) or len(item) < 6:
-            print(f"[WARN] Bad Bybit row for {symbol}: {item!r}")
-            continue
+            return FetchResult.terminal_failure(f"Bad Bybit row for {symbol}: {item!r}")
         quote_volume = item[6] if len(item) > 6 else item[5]
         rows.append([item[0], item[1], item[2], item[3], item[4], quote_volume])
-    return rows
+    return FetchResult.success(rows)
 
 
 def main() -> None:
-    reconcile_existing_csvs(
+    reconcile_existing_databases(
         exchange=EXCHANGE,
         intervals=INTERVALS,
         make_fetch_rows=lambda _interval, api_interval: (

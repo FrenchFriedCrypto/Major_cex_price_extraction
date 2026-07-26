@@ -26,7 +26,7 @@ def load_module(name: str, path: Path):
 spot_common = load_module("quiet_test_spot_common", ROOT / "get_spot_data" / "spot_common.py")
 spot_usdt_common = load_module(
     "quiet_test_spot_usdt_common",
-    ROOT / "get_spot_USDT_symbols" / "spot_usdt_common.py",
+    ROOT / "get_spot_symbols" / "spot_usdt_common.py",
 )
 
 
@@ -345,7 +345,7 @@ class SpotQuietOutputTests(unittest.TestCase):
         self.assertEqual(delisted_rows, [["oldusdt"]])
 
     def test_spot_usdt_scripts_use_shared_symbol_file_update_helper(self):
-        script_dir = ROOT / "get_spot_USDT_symbols"
+        script_dir = ROOT / "get_spot_symbols"
         script_paths = sorted(script_dir.glob("00_spot_usdt_*.py"))
         self.assertTrue(script_paths)
 

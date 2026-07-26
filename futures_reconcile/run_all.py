@@ -9,12 +9,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 ACTIVE_SCRIPTS = [
+    "reconcile_bitget.py",
     "reconcile_bybit.py",
     "reconcile_hyperliquid.py",
     "reconcile_mexc.py",
-    "reconcile_bitget.py",
-    "reconcile_coinw.py",
-    "reconcile_okx.py",
 ]
 
 

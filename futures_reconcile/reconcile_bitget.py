@@ -5,19 +5,28 @@ from datetime import datetime, timedelta, timezone
 try:
     from .reconcile_common import (
         DEFAULT_START_DT,
+        FetchResult,
         INTERVAL_MS,
+        RequestStatus,
         dt_to_ms,
-        reconcile_existing_csvs,
+        fetch_result_from_request_failure,
+        reconcile_existing_databases,
         request_json,
+        request_json_outcome,
     )
 except ImportError:
     from reconcile_common import (  # type: ignore
         DEFAULT_START_DT,
+        FetchResult,
         INTERVAL_MS,
+        RequestStatus,
         dt_to_ms,
-        reconcile_existing_csvs,
+        fetch_result_from_request_failure,
+        reconcile_existing_databases,
         request_json,
+        request_json_outcome,
     )
+from get_futures_data.futures_rate_limit import BITGET_REQUESTS_PER_SECOND
 
 
 EXCHANGE = "bitget"
@@ -38,8 +47,7 @@ INTERVALS = {
     "1M": "1M",
 }
 KLINE_LIMIT = 200
-BITGET_RATE_LIMIT_PER_SECOND = 20
-BITGET_SLEEP_BETWEEN_CALLS = 1 / BITGET_RATE_LIMIT_PER_SECOND
+BITGET_RATE_LIMIT_PER_SECOND = BITGET_REQUESTS_PER_SECOND
 BITGET_MAX_QUERY_RANGE_MS = 90 * 24 * 60 * 60 * 1000
 
 BITGET_FIXED_INTERVAL_MS = {
@@ -127,10 +135,10 @@ def normalize_bitget_window(api_interval: str, start_ms: int, end_ms: int) -> tu
     return request_start_ms, request_end_ms
 
 
-def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> list[list[object]]:
+def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> FetchResult:
     request_start_ms, request_end_ms = normalize_bitget_window(api_interval, start_ms, end_ms)
     if request_end_ms <= request_start_ms:
-        return []
+        return FetchResult.success([])
 
     params = {
         "symbol": symbol,
@@ -140,36 +148,36 @@ def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> 
         "endTime": str(request_end_ms),
         "limit": str(KLINE_LIMIT),
     }
-    data = request_json(KLINE_URL, params=params)
-    if not isinstance(data, dict) or data.get("code") != "00000":
-        print(f"Bitget API error for {symbol}: {data}")
-        return []
+    request_result = request_json_outcome(request_json, KLINE_URL, params=params)
+    if request_result.status is not RequestStatus.SUCCESS:
+        return fetch_result_from_request_failure(request_result, context=f"Bitget {symbol}")
+    data = request_result.value
+    if not isinstance(data, dict):
+        return FetchResult.terminal_failure(f"Unexpected Bitget response for {symbol}: {data!r}")
+    if data.get("code") != "00000":
+        return FetchResult.terminal_failure(f"Bitget API error for {symbol}: {data}")
 
     klines = data.get("data", [])
     if not isinstance(klines, list):
-        print(f"Unexpected Bitget kline format for {symbol}.")
-        return []
+        return FetchResult.terminal_failure(f"Unexpected Bitget kline format for {symbol}.")
 
     rows = []
     for item in klines:
         if not isinstance(item, list) or len(item) < 6:
-            print(f"[WARN] Bad Bitget row for {symbol}: {item!r}")
-            continue
+            return FetchResult.terminal_failure(f"Bad Bitget row for {symbol}: {item!r}")
         quote_volume = item[6] if len(item) > 6 else item[5]
         rows.append([item[0], item[1], item[2], item[3], item[4], quote_volume])
-    return rows
+    return FetchResult.success(rows)
 
 
 def main() -> None:
-    reconcile_existing_csvs(
+    reconcile_existing_databases(
         exchange=EXCHANGE,
         intervals=INTERVALS,
         make_fetch_rows=lambda _interval, api_interval: (
             lambda symbol, start, end: fetch_klines(symbol, api_interval, start, end)
         ),
         batch_candles=lambda interval, _api_interval: bitget_batch_candles(interval),
-        safe_start_ms=lambda _interval, api_interval: dt_to_ms(bitget_start_dt(api_interval)),
-        sleep_between_calls=BITGET_SLEEP_BETWEEN_CALLS,
     )
 
 

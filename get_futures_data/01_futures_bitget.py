@@ -2,12 +2,20 @@ from datetime import datetime, timedelta, timezone
 
 from futures_common import (
     DEFAULT_START_DT,
+    FetchResult,
     INTERVAL_MS,
+    RequestStatus,
+    fetch_result_from_request_failure,
     load_delisted_symbols,
+    load_symbol_listing_times,
     load_symbols,
     process_symbol,
     request_json,
+    request_json_outcome,
+    run_timeframe_collection,
+    start_dt_with_listing_time,
 )
+from futures_rate_limit import BITGET_REQUESTS_PER_SECOND
 
 
 EXCHANGE = "bitget"
@@ -30,8 +38,7 @@ INTERVALS = {
     "1M": "1M",
 }
 KLINE_LIMIT = 200
-BITGET_RATE_LIMIT_PER_SECOND = 20
-BITGET_SLEEP_BETWEEN_CALLS = 1 / BITGET_RATE_LIMIT_PER_SECOND
+BITGET_RATE_LIMIT_PER_SECOND = BITGET_REQUESTS_PER_SECOND
 BITGET_MAX_QUERY_RANGE_MS = 90 * 24 * 60 * 60 * 1000
 
 BITGET_FIXED_INTERVAL_MS = {
@@ -91,8 +98,9 @@ def ceil_to_bitget_boundary(api_interval: str, timestamp_ms: int) -> int:
     return next_bitget_boundary(api_interval, boundary_ms)
 
 
-def bitget_start_dt(api_interval: str) -> datetime:
-    start_ms = ceil_to_bitget_boundary(api_interval, _dt_to_ms(DEFAULT_START_DT))
+def bitget_start_dt(api_interval: str, listing_time_ms: int | None = None) -> datetime:
+    base_start = start_dt_with_listing_time(DEFAULT_START_DT, listing_time_ms)
+    start_ms = ceil_to_bitget_boundary(api_interval, _dt_to_ms(base_start))
     return _ms_to_utc_dt(start_ms)
 
 
@@ -119,10 +127,10 @@ def normalize_bitget_window(api_interval: str, start_ms: int, end_ms: int) -> tu
     return request_start_ms, request_end_ms
 
 
-def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> list[list[object]]:
+def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> FetchResult:
     request_start_ms, request_end_ms = normalize_bitget_window(api_interval, start_ms, end_ms)
     if request_end_ms <= request_start_ms:
-        return []
+        return FetchResult.success([])
 
     params = {
         "symbol": symbol,
@@ -132,24 +140,29 @@ def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> 
         "endTime": str(request_end_ms),
         "limit": str(KLINE_LIMIT),
     }
-    data = request_json(KLINE_URL, params=params)
-    if not isinstance(data, dict) or data.get("code") != "00000":
-        print(f"Bitget API error for {symbol}: {data}")
-        return []
+    request_result = request_json_outcome(request_json, KLINE_URL, params=params)
+    if request_result.status is not RequestStatus.SUCCESS:
+        return fetch_result_from_request_failure(request_result, context=f"Bitget {symbol}")
+    data = request_result.value
+    if not isinstance(data, dict):
+        return FetchResult.terminal_failure(f"Unexpected Bitget response for {symbol}: {data!r}")
+    if data.get("code") != "00000":
+        return FetchResult.terminal_failure(f"Bitget API error for {symbol}: {data}")
 
     klines = data.get("data", [])
     if not isinstance(klines, list):
-        print(f"Unexpected Bitget kline format for {symbol}.")
-        return []
+        return FetchResult.terminal_failure(f"Unexpected Bitget kline format for {symbol}.")
 
     rows = []
     for item in klines:
         if not isinstance(item, list) or len(item) < 6:
-            print(f"[WARN] Bad Bitget row for {symbol}: {item!r}")
-            continue
+            return FetchResult.terminal_failure(f"Bad Bitget row for {symbol}: {item!r}")
         quote_volume = item[6] if len(item) > 6 else item[5]
         rows.append([item[0], item[1], item[2], item[3], item[4], quote_volume])
-    return rows
+    return FetchResult.success(rows)
+
+
+_ORIGINAL_PROCESS_SYMBOL = process_symbol
 
 
 def main() -> None:
@@ -157,24 +170,40 @@ def main() -> None:
 
     delisted = load_delisted_symbols(EXCHANGE)
     symbols = [symbol for symbol in load_symbols(SYMBOLS_CSV) if symbol not in delisted]
+    listing_times = load_symbol_listing_times(SYMBOLS_CSV)
     if not symbols:
         print(f"[WARN] No active {EXCHANGE} symbols found.")
         return
 
     for interval, api_interval in INTERVALS.items():
-        for symbol in symbols:
-            try:
+        starts = {
+            symbol: bitget_start_dt(api_interval, listing_times.get(symbol))
+            for symbol in symbols
+        }
+        if process_symbol is not _ORIGINAL_PROCESS_SYMBOL:
+            for symbol in symbols:
                 process_symbol(
                     symbol,
                     interval,
                     EXCHANGE,
                     lambda s, start, end, api_interval=api_interval: fetch_klines(s, api_interval, start, end),
-                    start_dt=bitget_start_dt(api_interval),
+                    start_dt=starts[symbol],
                     batch_candles=bitget_batch_candles(interval),
-                    sleep_between_calls=BITGET_SLEEP_BETWEEN_CALLS,
                 )
-            except Exception as exc:
-                print(f"[ERROR] {symbol} @ {interval}: {exc}")
+            continue
+        run_timeframe_collection(
+            exchange=EXCHANGE,
+            interval=interval,
+            symbols=symbols,
+            fetch_rows=lambda s, start, end, api_interval=api_interval: fetch_klines(
+                s,
+                api_interval,
+                start,
+                end,
+            ),
+            start_dt=starts,
+            batch_candles=bitget_batch_candles(interval),
+        )
 
 
 if __name__ == "__main__":

@@ -1,24 +1,36 @@
 from __future__ import annotations
 
 import math
-import time
-from collections import deque
 from datetime import datetime, timedelta, timezone
 
 try:
     from .reconcile_common import (
+        FetchResult,
         INTERVAL_MS,
         dt_to_ms,
-        reconcile_existing_csvs,
+        reconcile_existing_databases,
         request_json,
     )
 except ImportError:
     from reconcile_common import (  # type: ignore
+        FetchResult,
         INTERVAL_MS,
         dt_to_ms,
-        reconcile_existing_csvs,
+        reconcile_existing_databases,
         request_json,
     )
+
+from get_futures_data.futures_rate_limit import (
+    HYPERLIQUID_CANDLE_BASE_WEIGHT,
+    HYPERLIQUID_CANDLE_ITEMS_PER_EXTRA_WEIGHT,
+    HYPERLIQUID_CANDLE_LIMIT,
+    HYPERLIQUID_CANDLE_RESERVED_WEIGHT,
+    HYPERLIQUID_WEIGHT_PER_MINUTE,
+    HYPERLIQUID_WINDOW_SECONDS,
+    HyperliquidWeightedRateLimiter,
+    get_exchange_rate_limiter,
+    hyperliquid_candle_weight,
+)
 
 
 EXCHANGE = "hyperliquid"
@@ -39,74 +51,16 @@ INTERVALS = {
     "1w": "1w",
     "1M": "1M",
 }
-HYPERLIQUID_CANDLE_LIMIT = 5000
 HYPERLIQUID_RECENT_CANDLE_LIMIT = HYPERLIQUID_CANDLE_LIMIT
-HYPERLIQUID_IP_WEIGHT_LIMIT = 1200
-HYPERLIQUID_IP_LIMIT_WINDOW_SECONDS = 60
-HYPERLIQUID_INFO_DEFAULT_WEIGHT = 20
-HYPERLIQUID_CANDLE_WEIGHT_ITEMS = 60
+HYPERLIQUID_IP_WEIGHT_LIMIT = HYPERLIQUID_WEIGHT_PER_MINUTE
+HYPERLIQUID_IP_LIMIT_WINDOW_SECONDS = HYPERLIQUID_WINDOW_SECONDS
+HYPERLIQUID_INFO_DEFAULT_WEIGHT = HYPERLIQUID_CANDLE_BASE_WEIGHT
+HYPERLIQUID_CANDLE_WEIGHT_ITEMS = HYPERLIQUID_CANDLE_ITEMS_PER_EXTRA_WEIGHT
 HYPERLIQUID_MIN_RETRY_SLEEP_SECONDS = 6
 HYPERLIQUID_MAX_RETRIES = 3
 HYPERLIQUID_EPOCH_START_DT = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-
-class HyperliquidWeightedRateLimiter:
-    def __init__(
-        self,
-        max_weight: int = HYPERLIQUID_IP_WEIGHT_LIMIT,
-        window_seconds: int = HYPERLIQUID_IP_LIMIT_WINDOW_SECONDS,
-        monotonic=time.monotonic,
-        sleep=time.sleep,
-    ) -> None:
-        self.max_weight = max_weight
-        self.window_seconds = window_seconds
-        self._monotonic = monotonic
-        self._sleep = sleep
-        self._calls: deque[tuple[float, int]] = deque()
-        self._used_weight = 0
-        self._last_request_time: float | None = None
-
-    def acquire(self, weight: int) -> None:
-        if weight < 1:
-            raise ValueError("weight must be at least 1")
-        if weight > self.max_weight:
-            raise ValueError(f"weight {weight} exceeds max window weight {self.max_weight}")
-
-        while True:
-            now = self._monotonic()
-            self._drop_expired(now)
-            wait_for_capacity = 0.0
-            if self._used_weight + weight > self.max_weight:
-                oldest_time = self._calls[0][0]
-                wait_for_capacity = max((oldest_time + self.window_seconds) - now, 0.0)
-
-            wait_for_pace = self._pace_sleep_seconds(weight, now)
-            sleep_seconds = max(wait_for_capacity, wait_for_pace)
-            if sleep_seconds > 0:
-                self._sleep(sleep_seconds)
-                continue
-
-            if self._used_weight + weight <= self.max_weight:
-                self._calls.append((now, weight))
-                self._used_weight += weight
-                self._last_request_time = now
-                return
-
-    def _drop_expired(self, now: float) -> None:
-        while self._calls and now - self._calls[0][0] >= self.window_seconds:
-            _, weight = self._calls.popleft()
-            self._used_weight -= weight
-
-    def _pace_sleep_seconds(self, weight: int, now: float) -> float:
-        if self._last_request_time is None:
-            return 0.0
-
-        weight_per_second = self.max_weight / self.window_seconds
-        next_allowed_time = self._last_request_time + (weight / weight_per_second)
-        return max(next_allowed_time - now, 0.0)
-
-
-HYPERLIQUID_RATE_LIMITER = HyperliquidWeightedRateLimiter()
+HYPERLIQUID_RATE_LIMITER = get_exchange_rate_limiter(EXCHANGE)
 
 
 def estimate_candle_count(api_interval: str, start_ms: int, end_ms: int) -> int:
@@ -116,9 +70,22 @@ def estimate_candle_count(api_interval: str, start_ms: int, end_ms: int) -> int:
     return min(candles, HYPERLIQUID_CANDLE_LIMIT)
 
 
-def candle_snapshot_weight(api_interval: str, start_ms: int, end_ms: int) -> int:
-    candle_count = estimate_candle_count(api_interval, start_ms, end_ms)
-    return HYPERLIQUID_INFO_DEFAULT_WEIGHT + math.ceil(candle_count / HYPERLIQUID_CANDLE_WEIGHT_ITEMS)
+def candle_snapshot_weight(
+    returned_items_or_interval: int | str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> int:
+    if isinstance(returned_items_or_interval, str):
+        if start_ms is None or end_ms is None:
+            raise ValueError("start_ms and end_ms are required with an interval")
+        returned_items = estimate_candle_count(
+            returned_items_or_interval,
+            start_ms,
+            end_ms,
+        )
+    else:
+        returned_items = int(returned_items_or_interval)
+    return hyperliquid_candle_weight(returned_items)
 
 
 def hyperliquid_retry_sleep_seconds(weight: int) -> int:
@@ -126,18 +93,32 @@ def hyperliquid_retry_sleep_seconds(weight: int) -> int:
     return max(HYPERLIQUID_MIN_RETRY_SLEEP_SECONDS, math.ceil(weight / weight_per_second))
 
 
-def post_info(payload: dict, request_weight: int = HYPERLIQUID_INFO_DEFAULT_WEIGHT) -> object | None:
+def post_info(
+    payload: dict,
+    request_weight: int = HYPERLIQUID_INFO_DEFAULT_WEIGHT,
+) -> object | None:
+    def reserve(_attempt: int):
+        return HYPERLIQUID_RATE_LIMITER.acquire(request_weight)
+
+    def refund(payload_value: object, reservation) -> None:
+        if reservation is None:
+            return
+        returned_items = len(payload_value) if isinstance(payload_value, list) else 0
+        reservation.refund_to(hyperliquid_candle_weight(returned_items))
+
     return request_json(
         INFO_URL,
         method="POST",
         json_body=payload,
         max_retries=HYPERLIQUID_MAX_RETRIES,
         retry_sleep_seconds=hyperliquid_retry_sleep_seconds(request_weight),
-        before_attempt=lambda _attempt: HYPERLIQUID_RATE_LIMITER.acquire(request_weight),
+        before_attempt=reserve,
+        after_success=refund,
+        use_inferred_rate_limiter=False,
     )
 
 
-def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> list[list[object]]:
+def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> FetchResult:
     payload = {
         "type": "candleSnapshot",
         "req": {
@@ -147,22 +128,30 @@ def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> 
             "endTime": end_ms,
         },
     }
-    request_weight = candle_snapshot_weight(api_interval, start_ms, end_ms)
-    data = post_info(payload, request_weight=request_weight)
+    data = post_info(payload, request_weight=HYPERLIQUID_CANDLE_RESERVED_WEIGHT)
     if not isinstance(data, list):
-        print(f"Unexpected Hyperliquid kline format for {symbol}: {data}")
-        return []
+        if data is None:
+            return FetchResult.retryable_failure(f"Hyperliquid request failed for {symbol}")
+        return FetchResult.terminal_failure(
+            f"Unexpected Hyperliquid kline format for {symbol}: {data}"
+        )
+    if len(data) > HYPERLIQUID_CANDLE_LIMIT:
+        return FetchResult.terminal_failure(
+            f"Hyperliquid returned {len(data)} candles for {symbol}; maximum is "
+            f"{HYPERLIQUID_CANDLE_LIMIT}"
+        )
 
     rows = []
     for item in data:
         if not isinstance(item, dict):
-            print(f"[WARN] Bad Hyperliquid row for {symbol}: {item!r}")
-            continue
+            return FetchResult.terminal_failure(f"Bad Hyperliquid row for {symbol}: {item!r}")
         try:
             rows.append([item["t"], item["o"], item["h"], item["l"], item["c"], item["v"]])
         except KeyError as exc:
-            print(f"[WARN] Missing Hyperliquid kline field {exc} for {symbol}: {item!r}")
-    return rows
+            return FetchResult.terminal_failure(
+                f"Missing Hyperliquid kline field {exc} for {symbol}: {item!r}"
+            )
+    return FetchResult.success(rows)
 
 
 def recent_start_dt(interval: str) -> datetime:
@@ -177,16 +166,13 @@ def _recent_start_ms(interval: str, _api_interval: str) -> int:
 
 
 def main() -> None:
-    reconcile_existing_csvs(
+    reconcile_existing_databases(
         exchange=EXCHANGE,
         intervals=INTERVALS,
         make_fetch_rows=lambda _interval, api_interval: (
             lambda symbol, start, end: fetch_klines(symbol, api_interval, start, end)
         ),
         batch_candles=HYPERLIQUID_CANDLE_LIMIT,
-        safe_start_ms=_recent_start_ms,
-        min_start_ms=_recent_start_ms,
-        preserve_symbol_case=True,
     )
 
 

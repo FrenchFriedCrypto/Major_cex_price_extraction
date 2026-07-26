@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,20 +53,22 @@ class HyperliquidRateLimitTests(unittest.TestCase):
             104,
         )
 
-    def test_weighted_limiter_paces_and_waits_for_rolling_capacity(self):
+    def test_weighted_limiter_allows_bursts_and_waits_for_rolling_capacity(self):
         clock = FakeClock()
-        limiter = hyperliquid.HyperliquidWeightedRateLimiter(
-            max_weight=120,
-            window_seconds=60,
-            monotonic=clock.monotonic,
-            sleep=clock.sleep,
-        )
+        with tempfile.TemporaryDirectory(dir=ROOT / "tests") as temp_dir:
+            limiter = hyperliquid.HyperliquidWeightedRateLimiter(
+                max_weight=120,
+                window_seconds=60,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                state_path=Path(temp_dir) / "hyperliquid.json",
+            )
 
-        limiter.acquire(100)
-        limiter.acquire(20)
-        limiter.acquire(1)
+            limiter.acquire(100)
+            limiter.acquire(20)
+            limiter.acquire(1)
 
-        self.assertEqual(clock.sleeps, [10.0, 50.0])
+        self.assertEqual(clock.sleeps, [60.0])
 
     def test_fetch_klines_uses_estimated_weight_for_post_info(self):
         interval_ms = hyperliquid.INTERVAL_MS["1m"]

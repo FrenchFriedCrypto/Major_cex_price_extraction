@@ -19,6 +19,7 @@ htmlcov/
 # Local tooling metadata and runtime state
 .agents/
 .bybit_rate_limit_state
+.futures_rate_limits/
 *.log
 symbol_first_candle_cache.json
 symbol_first_candle_cache.json.tmp

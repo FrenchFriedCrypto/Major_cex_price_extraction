@@ -1,4 +1,4 @@
-from usdt_common import request_json, update_symbol_files
+from usdt_common import request_json, update_symbol_files, update_symbol_listing_metadata
 
 
 HOST = "https://api.bybit.com"
@@ -42,6 +42,7 @@ def fetch_instruments() -> list[dict]:
 
 def get_symbols() -> None:
     symbols = []
+    listing_times_ms = {}
     for item in fetch_instruments():
         symbol = item.get("symbol")
         if (
@@ -52,8 +53,12 @@ def get_symbols() -> None:
             and item.get("status") == "Trading"
         ):
             symbols.append(symbol)
+            launch_time = item.get("launchTime")
+            if str(launch_time or "").strip():
+                listing_times_ms[symbol] = launch_time
 
     update_symbol_files(CSV_FILENAME, symbols)
+    update_symbol_listing_metadata(CSV_FILENAME, listing_times_ms)
 
 
 if __name__ == "__main__":
