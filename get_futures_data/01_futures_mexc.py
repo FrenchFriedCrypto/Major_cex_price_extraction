@@ -1,5 +1,4 @@
 from futures_common import (
-    get_output_folder,
     load_delisted_symbols,
     load_symbols,
     process_symbol,
@@ -68,13 +67,12 @@ def main() -> None:
         return
 
     for interval, api_interval in INTERVALS.items():
-        output_folder = get_output_folder(interval, EXCHANGE)
         for symbol in symbols:
             try:
                 process_symbol(
                     symbol,
                     interval,
-                    output_folder,
+                    EXCHANGE,
                     lambda s, start, end, api_interval=api_interval: fetch_klines(s, api_interval, start, end),
                     batch_candles=KLINE_LIMIT,
                 )

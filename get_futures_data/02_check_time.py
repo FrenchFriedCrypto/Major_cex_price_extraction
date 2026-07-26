@@ -1,50 +1,54 @@
-import pandas as pd
-import os
-from datetime import datetime, timedelta
+from datetime import timedelta
+from pathlib import Path
 
-from futures_common import get_output_folder
+import duckdb
 
-print("Now running check_time_get futures data script", flush=True)
+from futures_common import get_output_db_path
 
-# Define the folder path
-folder_path = get_output_folder("4h", "binance", create=False)
 
-# Define the expected time interval (e.g., 4 hours)
-expected_interval = timedelta(hours=4)
+EXPECTED_INTERVAL = timedelta(hours=4)
+TOLERANCE = timedelta(seconds=1)
 
-# Define a tolerance for floating-point discrepancies (optional)
-tolerance = timedelta(seconds=1)  # Allow a 1-second difference
 
-# Loop over each file in the folder
-for filename in os.listdir(folder_path):
-    if filename.endswith('.csv'):
-        file_path = os.path.join(folder_path, filename)
-        # print(f'Processing file: {file_path}')
-        try:
-            # Load the CSV file
-            df = pd.read_csv(file_path)
+def check_database(
+    database_path: Path,
+    expected_interval: timedelta = EXPECTED_INTERVAL,
+    tolerance: timedelta = TOLERANCE,
+) -> None:
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        symbols = connection.execute(
+            'SELECT DISTINCT "Symbol" FROM price_history ORDER BY "Symbol"'
+        ).fetchall()
 
-            # Ensure that 'Open time' is parsed as datetime
-            df['Open time'] = pd.to_datetime(df['Open time'])
+        for (symbol,) in symbols:
+            open_times = connection.execute(
+                """
+                SELECT "Open time"
+                FROM price_history
+                WHERE "Symbol" = ?
+                ORDER BY "Open time"
+                """,
+                [symbol],
+            ).fetchall()
 
-            # Sort the dataframe by 'Open time' to ensure correct order
-            df.sort_values(by='Open time', inplace=True)
-
-            # Reset index after sorting
-            df.reset_index(drop=True, inplace=True)
-
-            # Check intervals
-            for i in range(len(df) - 1):
-                current_time = df['Open time'].iloc[i]
-                next_time = df['Open time'].iloc[i + 1]
-
-                # Calculate the difference
+            for index in range(len(open_times) - 1):
+                current_time = open_times[index][0]
+                next_time = open_times[index + 1][0]
                 time_diff = next_time - current_time
 
-                # Check if the difference is not equal to the expected interval within tolerance
                 if abs(time_diff - expected_interval) > tolerance:
-                    print(f"In file {filename}, dates not {expected_interval} apart:")
+                    print(f"For symbol {symbol}, dates not {expected_interval} apart:")
                     print(f"  {current_time} and {next_time}")
                     print(f"  Duration apart: {time_diff}\n")
-        except Exception as e:
-            print(f"Error processing file {filename}: {e}\n")
+    finally:
+        connection.close()
+
+
+def main() -> None:
+    print("Now running check_time_get futures data script", flush=True)
+    check_database(get_output_db_path("binance", "4h"))
+
+
+if __name__ == "__main__":
+    main()

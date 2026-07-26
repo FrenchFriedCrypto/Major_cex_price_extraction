@@ -11,10 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+FUTURES_DIR = ROOT / "get_futures_data"
+if str(FUTURES_DIR) not in sys.path:
+    sys.path.insert(0, str(FUTURES_DIR))
 
 
 def load_module(name: str, path: Path):
@@ -162,9 +167,10 @@ class FuturesQuietOutputTests(unittest.TestCase):
         def fake_fetch(symbol, start_ms_arg, end_ms_arg):
             return [[start_ms, "1", "2", "0.5", "1.5", "100"]]
 
-        output_folder = reset_workspace_dir("_quiet_process")
+        futures_data_dir = reset_workspace_dir("_quiet_process")
         try:
             with (
+                patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir),
                 patch.object(futures_common, "utc_now_ms", lambda: available_until_ms),
                 patch.object(futures_common.time, "sleep", lambda seconds: None),
             ):
@@ -172,7 +178,7 @@ class FuturesQuietOutputTests(unittest.TestCase):
                     lambda: futures_common.process_symbol(
                         "TESTUSDT",
                         "1m",
-                        output_folder,
+                        "testexchange",
                         fake_fetch,
                         start_dt=start_dt,
                         batch_candles=1,
@@ -181,13 +187,23 @@ class FuturesQuietOutputTests(unittest.TestCase):
 
             self.assertEqual(stdout, "")
             self.assertEqual(stderr, "")
-            with (output_folder / "TESTUSDT.csv").open(newline="", encoding="utf-8") as csv_file:
-                rows = list(csv.reader(csv_file))
+            database_path = futures_data_dir / "testexchange" / "1m.duckdb"
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT "Symbol", "Open time", "Open", "High", "Low", "Close", "Volume", "Close time"
+                    FROM price_history
+                    """
+                ).fetchall()
+            finally:
+                connection.close()
         finally:
-            shutil.rmtree(output_folder, ignore_errors=True)
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
 
-        self.assertEqual(rows[0], futures_common.OUTPUT_COLUMNS)
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "TESTUSDT")
+        self.assertEqual(rows[0][1], start_dt.replace(tzinfo=None))
 
     def test_process_symbol_respects_min_start_ms_when_resuming_old_file(self):
         start_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -201,8 +217,10 @@ class FuturesQuietOutputTests(unittest.TestCase):
             calls.append((symbol, start_ms_arg, end_ms_arg))
             return [[min_start_ms, "1", "2", "0.5", "1.5", "100"]]
 
-        output_folder = reset_workspace_dir("_floor_process")
-        csv_path = output_folder / "TESTUSDT.csv"
+        futures_data_dir = reset_workspace_dir("_floor_process")
+        legacy_dir = futures_data_dir / "testexchange" / "1m"
+        legacy_dir.mkdir(parents=True)
+        csv_path = legacy_dir / "TESTUSDT.csv"
         try:
             with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
                 writer = csv.writer(csv_file)
@@ -218,8 +236,10 @@ class FuturesQuietOutputTests(unittest.TestCase):
                         futures_common.ms_to_utc_string(start_ms + interval_ms - 1),
                     ]
                 )
+            original_csv = csv_path.read_bytes()
 
             with (
+                patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir),
                 patch.object(futures_common, "utc_now_ms", lambda: available_until_ms),
                 patch.object(futures_common.time, "sleep", lambda seconds: None),
             ):
@@ -227,7 +247,7 @@ class FuturesQuietOutputTests(unittest.TestCase):
                     lambda: futures_common.process_symbol(
                         "TESTUSDT",
                         "1m",
-                        output_folder,
+                        "testexchange",
                         fake_fetch,
                         start_dt=start_dt,
                         batch_candles=1,
@@ -235,16 +255,320 @@ class FuturesQuietOutputTests(unittest.TestCase):
                     )
                 )
 
-            with csv_path.open(newline="", encoding="utf-8") as csv_file:
-                rows = list(csv.reader(csv_file))
+            database_path = futures_data_dir / "testexchange" / "1m.duckdb"
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT "Open time"
+                    FROM price_history
+                    WHERE "Symbol" = ?
+                    ORDER BY "Open time"
+                    """,
+                    ["TESTUSDT"],
+                ).fetchall()
+            finally:
+                connection.close()
+            migrated_csv = csv_path.read_bytes()
+            per_symbol_databases = list(legacy_dir.glob("*.duckdb"))
         finally:
-            shutil.rmtree(output_folder, ignore_errors=True)
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
 
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "")
         self.assertEqual(calls, [("TESTUSDT", min_start_ms, available_until_ms)])
-        self.assertEqual(len(rows), 3)
-        self.assertEqual(rows[-1][0], futures_common.ms_to_utc_string(min_start_ms))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1][0], datetime.fromtimestamp(min_start_ms / 1000, tz=timezone.utc).replace(tzinfo=None))
+        self.assertEqual(migrated_csv, original_csv)
+        self.assertEqual(per_symbol_databases, [])
+
+    def test_duckdb_layout_shares_symbols_and_separates_timeframes_and_exchanges(self):
+        futures_data_dir = reset_workspace_dir("_duckdb_layout")
+        row = ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 00:00:59"]
+        try:
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                bybit_1m = futures_common.get_output_db_path("ByBit", "1m")
+                bybit_5m = futures_common.get_output_db_path("ByBit", "5m")
+                bitget_1m = futures_common.get_output_db_path("BitGet", "1m")
+                for database_path in (bybit_1m, bybit_5m, bitget_1m):
+                    futures_common.initialize_database(database_path)
+
+                futures_common.append_output_rows(bybit_1m, "BTCUSDT", [row])
+                futures_common.append_output_rows(bybit_1m, "ETHUSDT", [row])
+                futures_common.append_output_rows(bybit_5m, "BTCUSDT", [row])
+                futures_common.append_output_rows(bitget_1m, "BTCUSDT", [row])
+
+            database_files = sorted(futures_data_dir.rglob("*.duckdb"))
+            self.assertEqual(database_files, sorted([bybit_1m, bybit_5m, bitget_1m]))
+            self.assertFalse(any(path.stem in {"BTCUSDT", "ETHUSDT"} for path in database_files))
+
+            connection = duckdb.connect(str(bybit_1m), read_only=True)
+            try:
+                symbols = connection.execute(
+                    'SELECT "Symbol" FROM price_history ORDER BY "Symbol"'
+                ).fetchall()
+            finally:
+                connection.close()
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertEqual(symbols, [("BTCUSDT",), ("ETHUSDT",)])
+
+    def test_price_history_schema_and_composite_primary_key(self):
+        futures_data_dir = reset_workspace_dir("_duckdb_schema")
+        try:
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                database_path = futures_common.get_output_db_path("bybit", "5m")
+                futures_common.initialize_database(database_path)
+
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                columns = connection.execute("PRAGMA table_info('price_history')").fetchall()
+                primary_key_columns = connection.execute(
+                    """
+                    SELECT constraint_column_names
+                    FROM duckdb_constraints()
+                    WHERE table_name = 'price_history'
+                      AND constraint_type = 'PRIMARY KEY'
+                    """
+                ).fetchone()[0]
+            finally:
+                connection.close()
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertEqual(
+            [(row[1], row[2], bool(row[3])) for row in columns],
+            [
+                ("Symbol", "VARCHAR", True),
+                ("Open time", "TIMESTAMP", True),
+                ("Open", "DOUBLE", False),
+                ("High", "DOUBLE", False),
+                ("Low", "DOUBLE", False),
+                ("Close", "DOUBLE", False),
+                ("Volume", "DOUBLE", False),
+                ("Close time", "TIMESTAMP", True),
+            ],
+        )
+        self.assertEqual(primary_key_columns, ["Symbol", "Open time"])
+
+    def test_duplicate_candles_are_ignored_but_symbols_can_share_open_time(self):
+        futures_data_dir = reset_workspace_dir("_duckdb_conflicts")
+        row = ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 00:00:59"]
+        try:
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                database_path = futures_common.get_output_db_path("bybit", "1m")
+                futures_common.initialize_database(database_path)
+                futures_common.append_output_rows(database_path, "BTCUSDT", [row, row])
+                futures_common.append_output_rows(database_path, "BTCUSDT", [row])
+                futures_common.append_output_rows(database_path, "ETHUSDT", [row])
+
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                rows = connection.execute(
+                    'SELECT "Symbol", COUNT(*) FROM price_history GROUP BY "Symbol" ORDER BY "Symbol"'
+                ).fetchall()
+            finally:
+                connection.close()
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertEqual(rows, [("BTCUSDT", 1), ("ETHUSDT", 1)])
+
+    def test_resume_lookup_is_scoped_to_requested_symbol(self):
+        futures_data_dir = reset_workspace_dir("_duckdb_resume")
+        btc_row = ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 00:00:59"]
+        eth_row = ["2026-01-01 00:02:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 00:02:59"]
+        try:
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                database_path = futures_common.get_output_db_path("bybit", "1m")
+                futures_common.initialize_database(database_path)
+                futures_common.append_output_rows(database_path, "BTCUSDT", [btc_row])
+                futures_common.append_output_rows(database_path, "ETHUSDT", [eth_row])
+                btc_last = futures_common.get_last_open_ms(database_path, "BTCUSDT")
+                eth_last = futures_common.get_last_open_ms(database_path, "ETHUSDT")
+                missing_last = futures_common.get_last_open_ms(database_path, "MISSING")
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertEqual(btc_last, futures_common.utc_string_to_ms(btc_row[0]))
+        self.assertEqual(eth_last, futures_common.utc_string_to_ms(eth_row[0]))
+        self.assertIsNone(missing_last)
+
+    def test_failed_batch_insertion_rolls_back_all_rows(self):
+        futures_data_dir = reset_workspace_dir("_duckdb_rollback")
+        valid_row = ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 00:00:59"]
+        invalid_row = ["2026-01-01 00:01:00", "not-a-number", 2, 0.5, 1.5, 100, "2026-01-01 00:01:59"]
+        try:
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                database_path = futures_common.get_output_db_path("bybit", "1m")
+                futures_common.initialize_database(database_path)
+                with self.assertRaises(ValueError):
+                    futures_common.append_output_rows(database_path, "BTCUSDT", [valid_row, invalid_row])
+
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                count = connection.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+            finally:
+                connection.close()
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertEqual(count, 0)
+
+    def test_legacy_csv_import_is_transactional_recorded_and_not_repeated(self):
+        futures_data_dir = reset_workspace_dir("_duckdb_migration")
+        legacy_dir = futures_data_dir / "hyperliquid" / "4h"
+        legacy_dir.mkdir(parents=True)
+        csv_path = legacy_dir / "kPEPE.csv"
+        row = ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 03:59:59"]
+        try:
+            with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(futures_common.OUTPUT_COLUMNS)
+                writer.writerow(row)
+            original_csv = csv_path.read_bytes()
+
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                database_path = futures_common.get_output_db_path("hyperliquid", "4h")
+                futures_common.initialize_database(database_path)
+                futures_common.initialize_database(database_path)
+
+            connection = duckdb.connect(str(database_path), read_only=True)
+            try:
+                price_rows = connection.execute(
+                    'SELECT "Symbol", COUNT(*) FROM price_history GROUP BY "Symbol"'
+                ).fetchall()
+                imports = connection.execute(
+                    'SELECT "CSV filename" FROM legacy_csv_imports'
+                ).fetchall()
+            finally:
+                connection.close()
+            migrated_csv = csv_path.read_bytes()
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertEqual(price_rows, [("kPEPE", 1)])
+        self.assertEqual(imports, [("kPEPE.csv",)])
+        self.assertEqual(migrated_csv, original_csv)
+
+    def test_fresh_process_does_not_create_price_history_csv(self):
+        start_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        start_ms = futures_common.dt_to_ms(start_dt)
+        available_until_ms = start_ms + futures_common.INTERVAL_MS["1m"]
+        futures_data_dir = reset_workspace_dir("_duckdb_no_fresh_csv")
+        try:
+            with (
+                patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir),
+                patch.object(futures_common, "utc_now_ms", lambda: available_until_ms),
+                patch.object(futures_common.time, "sleep", lambda seconds: None),
+            ):
+                futures_common.process_symbol(
+                    "BTCUSDT",
+                    "1m",
+                    "bybit",
+                    lambda symbol, start, end: [[start_ms, 1, 2, 0.5, 1.5, 100]],
+                    start_dt=start_dt,
+                    batch_candles=1,
+                )
+
+            self.assertEqual(list(futures_data_dir.rglob("*.csv")), [])
+            self.assertEqual(list(futures_data_dir.rglob("*.duckdb")), [futures_data_dir / "bybit" / "1m.duckdb"])
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+    def test_check_time_uses_binance_4h_database(self):
+        checker = load_module("quiet_test_check_time", ROOT / "get_futures_data" / "02_check_time.py")
+        calls = []
+        expected_path = Path("binance-4h.duckdb")
+
+        with (
+            patch.object(
+                checker,
+                "get_output_db_path",
+                lambda exchange, timeframe: calls.append((exchange, timeframe)) or expected_path,
+            ),
+            patch.object(checker, "check_database", calls.append),
+        ):
+            checker.main()
+
+        self.assertEqual(calls, [("binance", "4h"), expected_path])
+
+    def test_check_time_reports_database_gaps_by_symbol(self):
+        checker = load_module("quiet_test_check_time_gaps", FUTURES_DIR / "02_check_time.py")
+        futures_data_dir = reset_workspace_dir("_duckdb_check_time")
+        try:
+            with patch.object(futures_common, "FUTURES_DATA_DIR", futures_data_dir):
+                database_path = futures_common.get_output_db_path("binance", "4h")
+                futures_common.initialize_database(database_path)
+                futures_common.append_output_rows(
+                    database_path,
+                    "BTCUSDT",
+                    [
+                        ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 03:59:59"],
+                        ["2026-01-01 08:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 11:59:59"],
+                    ],
+                )
+                futures_common.append_output_rows(
+                    database_path,
+                    "ETHUSDT",
+                    [
+                        ["2026-01-01 00:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 03:59:59"],
+                        ["2026-01-01 04:00:00", 1, 2, 0.5, 1.5, 100, "2026-01-01 07:59:59"],
+                    ],
+                )
+
+            _, stdout, stderr = self.capture_output(lambda: checker.check_database(database_path))
+        finally:
+            shutil.rmtree(futures_data_dir, ignore_errors=True)
+
+        self.assertIn("For symbol BTCUSDT", stdout)
+        self.assertNotIn("For symbol ETHUSDT", stdout)
+        self.assertIn("Duration apart: 8:00:00", stdout)
+        self.assertEqual(stderr, "")
+
+    def test_active_exchange_scripts_pass_exchange_to_process_symbol(self):
+        for module_name, filename, api_interval in (
+            ("quiet_test_bitget_exchange", "01_futures_bitget.py", "5m"),
+            ("quiet_test_bybit_exchange", "01_futures_bybit.py", "5"),
+            ("quiet_test_hyperliquid_exchange", "01_futures_hyperliquid.py", "5m"),
+            ("quiet_test_mexc_exchange", "01_futures_mexc.py", "Min5"),
+        ):
+            with self.subTest(filename=filename):
+                module = load_module(module_name, FUTURES_DIR / filename)
+                process_calls = []
+                patches = [
+                    patch.object(module, "INTERVALS", {"5m": api_interval}),
+                    patch.object(module, "load_delisted_symbols", lambda exchange: set()),
+                    patch.object(
+                        module,
+                        "load_symbols",
+                        lambda csv_filename, **kwargs: ["CaseSensitiveSymbol"],
+                    ),
+                    patch.object(
+                        module,
+                        "process_symbol",
+                        lambda *args, **kwargs: process_calls.append((args, kwargs)),
+                    ),
+                ]
+                if filename == "01_futures_hyperliquid.py":
+                    patches.append(
+                        patch.object(
+                            module,
+                            "recent_start_dt",
+                            lambda interval: datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        )
+                    )
+
+                with patches[0], patches[1], patches[2], patches[3]:
+                    if len(patches) == 5:
+                        with patches[4]:
+                            module.main()
+                    else:
+                        module.main()
+
+                self.assertEqual(len(process_calls), 1)
+                self.assertEqual(process_calls[0][0][2], module.EXCHANGE)
 
     def test_build_output_rows_bad_row_still_warns(self):
         result, stdout, stderr = self.capture_output(

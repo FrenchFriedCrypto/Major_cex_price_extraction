@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from futures_common import (
     INTERVAL_MS,
     dt_to_ms,
-    get_output_folder,
     load_delisted_symbols,
     load_symbols,
     process_symbol,
@@ -181,14 +180,13 @@ def main() -> None:
         return
 
     for interval, api_interval in INTERVALS.items():
-        output_folder = get_output_folder(interval, EXCHANGE)
         start_dt = recent_start_dt(interval)
         for symbol in symbols:
             try:
                 process_symbol(
                     symbol,
                     interval,
-                    output_folder,
+                    EXCHANGE,
                     lambda s, start, end, api_interval=api_interval: fetch_klines(s, api_interval, start, end),
                     start_dt=start_dt,
                     batch_candles=HYPERLIQUID_CANDLE_LIMIT,

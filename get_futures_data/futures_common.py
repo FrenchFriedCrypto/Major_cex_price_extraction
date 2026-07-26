@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import duckdb
 import requests
 
 
@@ -21,6 +22,43 @@ SLEEP_BETWEEN_CALLS = 0.2
 DEFAULT_START_DT = datetime(2023, 1, 1, tzinfo=timezone.utc)
 BATCH_CANDLES = 1000
 RETRYABLE_STATUS_CODES = {400, 418, 429}
+
+
+PRICE_HISTORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS price_history (
+    "Symbol" VARCHAR NOT NULL,
+    "Open time" TIMESTAMP NOT NULL,
+    "Open" DOUBLE,
+    "High" DOUBLE,
+    "Low" DOUBLE,
+    "Close" DOUBLE,
+    "Volume" DOUBLE,
+    "Close time" TIMESTAMP NOT NULL,
+    PRIMARY KEY ("Symbol", "Open time")
+)
+"""
+
+LEGACY_CSV_IMPORTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS legacy_csv_imports (
+    "CSV filename" VARCHAR PRIMARY KEY,
+    "Imported at" TIMESTAMP NOT NULL
+)
+"""
+
+INSERT_PRICE_HISTORY_SQL = """
+INSERT INTO price_history (
+    "Symbol",
+    "Open time",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "Close time"
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT ("Symbol", "Open time") DO NOTHING
+"""
 
 
 INTERVAL_MS = {
@@ -247,32 +285,134 @@ def get_output_folder(interval: str, exchange: str, create: bool = True) -> Path
     return output_folder
 
 
-def get_last_open_ms(csv_path: Path) -> int | None:
-    if not csv_path.exists() or csv_path.stat().st_size == 0:
+def get_output_db_path(exchange: str, timeframe: str) -> Path:
+    exchange_dir = FUTURES_DATA_DIR / exchange.lower()
+    exchange_dir.mkdir(parents=True, exist_ok=True)
+    return exchange_dir / f"{timeframe}.duckdb"
+
+
+def _create_database_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute(PRICE_HISTORY_TABLE_SQL)
+    connection.execute(LEGACY_CSV_IMPORTS_TABLE_SQL)
+
+
+def _parse_utc_timestamp(value: object) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("timestamp is empty")
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or str(value).strip() == "":
         return None
+    return float(value)
 
-    last_open: int | None = None
-    with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
-        reader = csv.reader(csv_file)
-        next(reader, None)
-        for row in reader:
-            if not row or not row[0].strip():
+
+def _prepare_price_row(symbol: str, row: Sequence[object]) -> tuple[object, ...]:
+    if len(row) < len(OUTPUT_COLUMNS):
+        raise ValueError(f"price-history row has {len(row)} columns; expected {len(OUTPUT_COLUMNS)}")
+    return (
+        symbol,
+        _parse_utc_timestamp(row[0]),
+        _optional_float(row[1]),
+        _optional_float(row[2]),
+        _optional_float(row[3]),
+        _optional_float(row[4]),
+        _optional_float(row[5]),
+        _parse_utc_timestamp(row[6]),
+    )
+
+
+def _read_legacy_csv_rows(csv_path: Path, symbol: str) -> list[tuple[object, ...]]:
+    rows: list[tuple[object, ...]] = []
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if reader.fieldnames is None or any(column not in reader.fieldnames for column in OUTPUT_COLUMNS):
+            raise ValueError(f"missing required columns: {OUTPUT_COLUMNS}")
+
+        for csv_row in reader:
+            if not csv_row or not any(str(value or "").strip() for value in csv_row.values()):
                 continue
-            try:
-                dt_value = datetime.strptime(row[0].strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            last_open = dt_to_ms(dt_value)
-    return last_open
+            rows.append(_prepare_price_row(symbol, [csv_row[column] for column in OUTPUT_COLUMNS]))
+    return rows
 
 
-def ensure_output_csv(csv_path: Path) -> None:
-    if csv_path.exists() and csv_path.stat().st_size > 0:
+def migrate_legacy_csvs(database_path: Path) -> None:
+    legacy_timeframe_dir = database_path.with_suffix("")
+    if not legacy_timeframe_dir.is_dir():
         return
 
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-        csv.writer(csv_file).writerow(OUTPUT_COLUMNS)
+    for csv_path in sorted(legacy_timeframe_dir.glob("*.csv")):
+        connection = duckdb.connect(str(database_path))
+        try:
+            _create_database_tables(connection)
+            already_imported = connection.execute(
+                'SELECT 1 FROM legacy_csv_imports WHERE "CSV filename" = ?',
+                [csv_path.name],
+            ).fetchone()
+            if already_imported is not None:
+                continue
+
+            imported_rows = _read_legacy_csv_rows(csv_path, csv_path.stem)
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                if imported_rows:
+                    connection.executemany(INSERT_PRICE_HISTORY_SQL, imported_rows)
+                connection.execute(
+                    'INSERT INTO legacy_csv_imports ("CSV filename", "Imported at") VALUES (?, ?)',
+                    [csv_path.name, datetime.now(timezone.utc).replace(tzinfo=None)],
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        except Exception as exc:
+            print(f"[WARN] Failed to import legacy price history {csv_path}: {exc}")
+        finally:
+            connection.close()
+
+
+def initialize_database(database_path: Path) -> None:
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(str(database_path))
+    try:
+        _create_database_tables(connection)
+    finally:
+        connection.close()
+    migrate_legacy_csvs(database_path)
+
+
+def get_last_open_ms(database_path: Path, symbol: str) -> int | None:
+    if not database_path.exists():
+        initialize_database(database_path)
+
+    connection = duckdb.connect(str(database_path), read_only=True)
+    try:
+        result = connection.execute(
+            """
+            SELECT MAX("Open time")
+            FROM price_history
+            WHERE "Symbol" = ?
+            """,
+            [symbol],
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if result is None or result[0] is None:
+        return None
+    last_open = result[0]
+    if not isinstance(last_open, datetime):
+        last_open = _parse_utc_timestamp(last_open)
+    return dt_to_ms(last_open.replace(tzinfo=timezone.utc))
 
 
 def build_output_rows(
@@ -318,20 +458,34 @@ def build_output_rows(
     return output_rows
 
 
-def append_output_rows(csv_path: Path, rows: Iterable[Sequence[object]]) -> None:
-    final_rows = list(rows)
-    if not final_rows:
+def append_output_rows(
+    database_path: Path,
+    symbol: str,
+    rows: Iterable[Sequence[object]],
+) -> None:
+    prepared_rows = [_prepare_price_row(symbol, row) for row in rows]
+    if not prepared_rows:
         return
 
-    ensure_output_csv(csv_path)
-    with csv_path.open("a", newline="", encoding="utf-8") as csv_file:
-        csv.writer(csv_file).writerows(final_rows)
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(str(database_path))
+    try:
+        _create_database_tables(connection)
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            connection.executemany(INSERT_PRICE_HISTORY_SQL, prepared_rows)
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
 
 
 def process_symbol(
     symbol: str,
     interval: str,
-    output_folder: Path,
+    exchange: str,
     fetch_rows,
     start_dt: datetime = DEFAULT_START_DT,
     batch_candles: int = BATCH_CANDLES,
@@ -340,10 +494,10 @@ def process_symbol(
     sleep_between_calls: float = SLEEP_BETWEEN_CALLS,
 ) -> None:
     interval_ms = INTERVAL_MS[interval]
-    csv_path = output_folder / f"{symbol}.csv"
-    ensure_output_csv(csv_path)
+    database_path = get_output_db_path(exchange, interval)
+    initialize_database(database_path)
 
-    last_open_ms = get_last_open_ms(csv_path)
+    last_open_ms = get_last_open_ms(database_path, symbol)
     if last_open_ms is None:
         current_ms = dt_to_ms(start_dt)
     else:
@@ -369,7 +523,7 @@ def process_symbol(
 
         output_rows = build_output_rows(raw_rows or [], interval_ms, last_open_ms, available_until_ms)
         if output_rows:
-            append_output_rows(csv_path, output_rows)
+            append_output_rows(database_path, symbol, output_rows)
             last_open_ms = utc_string_to_ms(str(output_rows[-1][0]))
 
         current_ms = end_ms

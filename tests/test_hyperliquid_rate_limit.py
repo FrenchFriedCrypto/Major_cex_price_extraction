@@ -122,7 +122,6 @@ class HyperliquidRateLimitTests(unittest.TestCase):
             patch.object(hyperliquid, "INTERVALS", {"1m": "1m"}),
             patch.object(hyperliquid, "load_delisted_symbols", lambda exchange: set()),
             patch.object(hyperliquid, "load_symbols", fake_load_symbols),
-            patch.object(hyperliquid, "get_output_folder", lambda interval, exchange: Path("out")),
             patch.object(hyperliquid, "recent_start_dt", lambda interval: start_dt),
             patch.object(hyperliquid, "process_symbol", fake_process_symbol),
         ):
@@ -130,6 +129,7 @@ class HyperliquidRateLimitTests(unittest.TestCase):
 
         self.assertEqual(load_calls, [(hyperliquid.SYMBOLS_CSV, True)])
         self.assertEqual(process_calls[0][0][0], "kPEPE")
+        self.assertEqual(process_calls[0][0][2], hyperliquid.EXCHANGE)
         self.assertEqual(process_calls[0][1]["min_start_ms"], hyperliquid.dt_to_ms(start_dt))
 
     def test_recent_start_dt_never_returns_negative_epoch_ms(self):

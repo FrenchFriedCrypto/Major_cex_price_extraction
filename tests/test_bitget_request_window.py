@@ -76,12 +76,12 @@ class BitgetRequestWindowTests(unittest.TestCase):
             patch.object(bitget, "INTERVALS", {"1w": "1W", "1M": "1M"}),
             patch.object(bitget, "load_delisted_symbols", lambda exchange: set()),
             patch.object(bitget, "load_symbols", lambda csv_filename: ["BTCUSDT"]),
-            patch.object(bitget, "get_output_folder", lambda interval, exchange: Path("out")),
             patch.object(bitget, "process_symbol", fake_process_symbol),
         ):
             bitget.main()
 
         self.assertEqual(process_calls[0][1]["batch_candles"], 11)
+        self.assertEqual(process_calls[0][0][2], bitget.EXCHANGE)
         self.assertEqual(process_calls[0][1]["sleep_between_calls"], bitget.BITGET_SLEEP_BETWEEN_CALLS)
         self.assertEqual(process_calls[0][1]["start_dt"], datetime(2023, 1, 2, tzinfo=timezone.utc))
         self.assertEqual(process_calls[1][1]["batch_candles"], 2)

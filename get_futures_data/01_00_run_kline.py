@@ -11,8 +11,6 @@ ACTIVE_SCRIPTS = [
     "01_futures_hyperliquid.py",
     "01_futures_mexc.py",
     "01_futures_bitget.py",
-    "01_futures_coinw.py",
-    "01_futures_okx.py",
 ]
 
 
