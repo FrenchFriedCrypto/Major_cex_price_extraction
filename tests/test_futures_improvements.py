@@ -31,7 +31,7 @@ def load_module(name: str, path: Path):
 bitget = load_module("improvements_bitget", FUTURES_DIR / "01_futures_bitget.py")
 hyperliquid = load_module(
     "improvements_hyperliquid",
-    FUTURES_DIR / "01_futures_hyperliquid.py",
+    FUTURES_DIR / "deprecated" / "01_futures_hyperliquid.py",
 )
 collector_runner = load_module(
     "improvements_collector_runner",
@@ -236,7 +236,13 @@ class CursorReliabilityTests(unittest.TestCase):
 
                     with (
                         patch.object(fc, "FUTURES_DATA_DIR", Path(temp_dir)),
-                        patch.object(fc, "utc_now_ms", lambda: start_ms + interval_ms * 2),
+                        patch.object(
+                            fc,
+                            "utc_now_ms",
+                            lambda: start_ms
+                            + interval_ms * 2
+                            + fc.CANDLE_SETTLEMENT_DELAY_MS,
+                        ),
                     ):
                         completed = fc.process_symbol(
                             "TESTUSDT",
@@ -250,7 +256,7 @@ class CursorReliabilityTests(unittest.TestCase):
                     self.assertFalse(completed)
                     self.assertEqual(calls, [(start_ms, start_ms + interval_ms)])
 
-    def test_successful_empty_response_advances_window(self):
+    def test_empty_response_advances_only_during_first_candle_discovery(self):
         start_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
         start_ms = fc.dt_to_ms(start_dt)
         interval_ms = fc.INTERVAL_MS["1m"]
@@ -258,7 +264,13 @@ class CursorReliabilityTests(unittest.TestCase):
         with self.make_data_dir() as temp_dir:
             with (
                 patch.object(fc, "FUTURES_DATA_DIR", Path(temp_dir)),
-                patch.object(fc, "utc_now_ms", lambda: start_ms + interval_ms * 2),
+                patch.object(
+                    fc,
+                    "utc_now_ms",
+                    lambda: start_ms
+                    + interval_ms * 2
+                    + fc.CANDLE_SETTLEMENT_DELAY_MS,
+                ),
             ):
                 completed = fc.process_symbol(
                     "TESTUSDT",
@@ -316,7 +328,13 @@ class CursorReliabilityTests(unittest.TestCase):
 
             with (
                 patch.object(fc, "FUTURES_DATA_DIR", Path(temp_dir) / "data"),
-                patch.object(fc, "utc_now_ms", lambda: start_ms + interval_ms * 2),
+                patch.object(
+                    fc,
+                    "utc_now_ms",
+                    lambda: start_ms
+                    + interval_ms * 2
+                    + fc.CANDLE_SETTLEMENT_DELAY_MS,
+                ),
             ):
                 completed = fc.process_symbol(
                     "BTCUSDT",
@@ -398,10 +416,17 @@ class DuckDBReliabilityTests(unittest.TestCase):
             def fetch(symbol, start, end):
                 calls.append((symbol, start, end))
                 return fc.FetchResult.success(
-                    [[interval_ms, 2, 3, 1.5, 2.5, 200]]
+                    [
+                        [open_ms, 2, 3, 1.5, 2.5, 200]
+                        for open_ms in range(start, end, interval_ms)
+                    ]
                 )
 
-            with patch.object(rc, "utc_now_ms", lambda: interval_ms * 3):
+            with patch.object(
+                rc,
+                "utc_now_ms",
+                lambda: interval_ms * 3 + fc.CANDLE_SETTLEMENT_DELAY_MS,
+            ):
                 repaired = rc.reconcile_database(
                     database_path,
                     interval="1m",
@@ -418,7 +443,13 @@ class DuckDBReliabilityTests(unittest.TestCase):
                 connection.close()
 
         self.assertEqual(repaired, 1)
-        self.assertEqual(calls, [("TESTUSDT", interval_ms, interval_ms * 2)])
+        self.assertEqual(
+            calls,
+            [
+                ("TESTUSDT", 0, interval_ms),
+                ("TESTUSDT", interval_ms, interval_ms * 2),
+            ],
+        )
         self.assertEqual(len(rows), 3)
 
     def test_writer_rolls_back_failed_bulk_batch(self):
@@ -463,7 +494,11 @@ class DuckDBReliabilityTests(unittest.TestCase):
             data_dir = Path(temp_dir)
             with (
                 patch.object(fc, "FUTURES_DATA_DIR", data_dir),
-                patch.object(fc, "utc_now_ms", lambda: start_ms + interval_ms),
+                patch.object(
+                    fc,
+                    "utc_now_ms",
+                    lambda: start_ms + interval_ms + fc.CANDLE_SETTLEMENT_DELAY_MS,
+                ),
             ):
                 fc.process_symbol(
                     "TESTUSDT",
@@ -473,7 +508,6 @@ class DuckDBReliabilityTests(unittest.TestCase):
                         [
                             [start_ms, 1, 2, 0.5, 1.5, 100],
                             [start_ms, 1, 2, 0.5, 1.5, 100],
-                            [start_ms + interval_ms, 2, 3, 1.5, 2.5, 200],
                         ]
                     ),
                     start_dt=start_dt,
@@ -493,7 +527,7 @@ class ListingAndScopeTests(unittest.TestCase):
     def test_listing_timestamp_reduces_initial_request_range(self):
         listing_ms = fc.dt_to_ms(datetime(2025, 5, 2, 12, 34, tzinfo=timezone.utc))
         start_dt = bitget.bitget_start_dt("1H", listing_ms)
-        self.assertEqual(start_dt, datetime(2025, 5, 2, 13, 0, tzinfo=timezone.utc))
+        self.assertEqual(start_dt, datetime(2025, 5, 2, 12, 0, tzinfo=timezone.utc))
         self.assertGreater(start_dt, fc.DEFAULT_START_DT)
 
     def test_one_column_symbol_csv_remains_supported_with_optional_metadata(self):
@@ -535,7 +569,6 @@ class ListingAndScopeTests(unittest.TestCase):
             collector_runner.ACTIVE_SCRIPTS,
             [
                 "01_futures_bybit.py",
-                "01_futures_hyperliquid.py",
                 "01_futures_mexc.py",
                 "01_futures_bitget.py",
             ],

@@ -18,26 +18,38 @@ for import_path in (PROJECT_ROOT, GET_FUTURES_DIR):
     if import_path_str not in sys.path:
         sys.path.insert(0, import_path_str)
 
-from get_futures_data.futures_common import (  # noqa: E402
+from futures_common import (  # noqa: E402
     DEFAULT_START_DT,
     FUTURES_DATA_DIR,
     INTERVAL_MS,
     OUTPUT_COLUMNS,
     SLEEP_BETWEEN_CALLS,
+    CANDLE_SETTLEMENT_DELAY_MS,
     DuckDBPriceWriter,
     FetchResult,
     FetchWindowError,
+    KlineValidationError,
     RequestResult,
     RequestStatus,
+    advance_candle_open_ms,
+    candle_close_ms,
+    ceil_to_candle_boundary,
     coerce_fetch_result,
     dt_to_ms,
+    expected_open_times,
     fetch_result_from_request_failure,
+    floor_to_candle_boundary,
     get_output_folder,
+    is_candle_open_aligned,
     load_delisted_symbols,
     ms_to_utc_string,
+    next_candle_open_ms,
     request_json,
     request_json_outcome,
+    settled_candle_end_ms,
     utc_now_ms,
+    utc_string_to_ms,
+    validate_raw_kline_rows,
 )
 
 
@@ -243,21 +255,23 @@ def fetch_missing_range(
     min_start_ms: int | None = None,
     sleep_between_calls: float = SLEEP_BETWEEN_CALLS,
 ) -> pd.DataFrame:
-    interval_ms = INTERVAL_MS[interval]
     cursor = max(start_ms, min_start_ms) if min_start_ms is not None else start_ms
     final_end = min(end_ms, complete_before)
-    if cursor + interval_ms > complete_before or final_end <= cursor:
+    cursor = ceil_to_candle_boundary(interval, cursor)
+    if cursor >= complete_before or final_end <= cursor:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    step_ms = max(1, int(batch_candles)) * interval_ms
-    fetched_frames: list[pd.DataFrame] = []
-    provider_returned_rows = False
+    final_end = ceil_to_candle_boundary(interval, final_end)
+    if final_end > complete_before:
+        final_end = complete_before
+    output_rows: list[list[object]] = []
 
     while cursor < final_end:
-        if cursor + interval_ms > complete_before:
-            break
-
-        window_end = min(cursor + step_ms, final_end, complete_before)
+        window_end = min(
+            advance_candle_open_ms(cursor, interval, max(1, int(batch_candles))),
+            final_end,
+            complete_before,
+        )
         if window_end <= cursor:
             break
 
@@ -273,59 +287,45 @@ def fetch_missing_range(
 
         if not fetch_result.succeeded:
             raise FetchWindowError(fetch_result)
-
-        raw_rows = fetch_result.rows
-        malformed_row = next(
-            (
-                row
-                for row in raw_rows
-                if len(row) < 6 or _coerce_open_ms(row[0]) is None
-            ),
-            None,
-        )
-        if malformed_row is not None:
+        if not fetch_result.rows:
             raise FetchWindowError(
-                FetchResult.terminal_failure(
-                    f"malformed row for {symbol} {interval}: {malformed_row!r}"
+                FetchResult.retryable_failure(
+                    f"empty closed range for {symbol} {interval} "
+                    f"{ms_to_utc_string(cursor)}..{ms_to_utc_string(window_end)}"
                 )
             )
 
-        if raw_rows:
-            provider_returned_rows = True
-            frame = raw_rows_to_frame(
-                raw_rows,
-                interval_ms,
-                complete_before,
-                range_start_ms=cursor,
-                range_end_ms=window_end,
-                symbol=symbol,
-                interval=interval,
+        try:
+            output_rows.extend(
+                validate_raw_kline_rows(
+                    fetch_result.rows,
+                    symbol=symbol,
+                    interval=interval,
+                    start_ms=cursor,
+                    end_ms=window_end,
+                    require_full_window=True,
+                )
             )
-            if not frame.empty:
-                fetched_frames.append(frame)
+        except KlineValidationError as exc:
+            raise FetchWindowError(
+                FetchResult.terminal_failure(
+                    f"invalid fetched range for {symbol} {interval}: {exc}"
+                )
+            ) from exc
 
         cursor = window_end
         if sleep_between_calls > 0:
             time.sleep(sleep_between_calls)
 
-    if not provider_returned_rows:
-        print(
-            f"[WARN] No rows retrieved for missing range {symbol} {interval} "
-            f"{ms_to_utc_string(start_ms)}..{ms_to_utc_string(end_ms)}."
+    if cursor != final_end:
+        raise FetchWindowError(
+            FetchResult.terminal_failure(
+                f"off-grid requested range for {symbol} {interval}: "
+                f"cursor={cursor}, end={final_end}"
+            )
         )
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    if not fetched_frames:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
-
-    fetched = pd.concat(fetched_frames, ignore_index=True)
-    return merge_sort_dedupe(
-        pd.DataFrame(columns=OUTPUT_COLUMNS),
-        fetched,
-        interval_ms,
-        complete_before,
-        context=f" for fetched {symbol} {interval}",
-    )
+    return pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
 
 
 def reconcile_symbol_csv(
@@ -416,6 +416,116 @@ def reconcile_symbol_csv(
     return False
 
 
+def _merge_repair_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start_ms, end_ms in sorted((int(start), int(end)) for start, end in ranges):
+        if end_ms <= start_ms:
+            continue
+        if not merged or start_ms > merged[-1][1]:
+            merged.append((start_ms, end_ms))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_ms))
+    return merged
+
+
+def _stored_row_to_output(
+    row: Sequence[Any],
+    *,
+    symbol: str,
+    interval: str,
+    complete_end: int,
+) -> tuple[int, list[object]]:
+    if len(row) < len(OUTPUT_COLUMNS):
+        raise KlineValidationError(f"stored row has {len(row)} columns")
+    open_time = row[0]
+    if not isinstance(open_time, datetime):
+        open_time = pd.to_datetime(open_time, utc=True, errors="raise").to_pydatetime()
+    if open_time.tzinfo is None:
+        open_time = open_time.replace(tzinfo=timezone.utc)
+    open_ms = dt_to_ms(open_time.astimezone(timezone.utc))
+    if not is_candle_open_aligned(open_ms, interval):
+        raise KlineValidationError(f"off-grid stored open {open_ms}")
+    if open_ms >= complete_end:
+        raise KlineValidationError(f"incomplete stored candle {open_ms}")
+
+    close_time = row[6]
+    if not isinstance(close_time, datetime):
+        close_time = pd.to_datetime(close_time, utc=True, errors="raise").to_pydatetime()
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=timezone.utc)
+    stored_close_ms = dt_to_ms(close_time.astimezone(timezone.utc))
+    expected_close_ms = (candle_close_ms(open_ms, interval) // 1000) * 1000
+    if stored_close_ms != expected_close_ms:
+        raise KlineValidationError(
+            f"bad close time for {open_ms}: {stored_close_ms} != {expected_close_ms}"
+        )
+
+    output = validate_raw_kline_rows(
+        [[open_ms, row[1], row[2], row[3], row[4], row[5]]],
+        symbol=symbol,
+        interval=interval,
+        start_ms=open_ms,
+        end_ms=next_candle_open_ms(open_ms, interval),
+        require_full_window=True,
+    )[0]
+    return open_ms, output
+
+
+def _discover_first_available_open_ms(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    search_end_ms: int,
+    fetch_rows: FetchRows,
+    *,
+    batch_candles: int,
+) -> int | None:
+    cursor = ceil_to_candle_boundary(interval, start_ms)
+    search_end_ms = max(cursor, int(search_end_ms))
+    while cursor < search_end_ms:
+        window_end = min(
+            advance_candle_open_ms(cursor, interval, max(1, int(batch_candles))),
+            search_end_ms,
+        )
+        result = coerce_fetch_result(fetch_rows(symbol, cursor, window_end))
+        if not result.succeeded:
+            raise FetchWindowError(result)
+        if not result.rows:
+            cursor = window_end
+            continue
+
+        partial = validate_raw_kline_rows(
+            result.rows,
+            symbol=symbol,
+            interval=interval,
+            start_ms=cursor,
+            end_ms=window_end,
+            require_full_window=False,
+        )
+        if not partial:
+            cursor = window_end
+            continue
+        first_open_ms = utc_string_to_ms(str(partial[0][0]))
+        validate_raw_kline_rows(
+            result.rows,
+            symbol=symbol,
+            interval=interval,
+            start_ms=first_open_ms,
+            end_ms=window_end,
+            require_full_window=True,
+        )
+        return first_open_ms
+    return None
+
+
+def _symbol_setting(value: Any, symbol: str) -> Any:
+    if callable(value):
+        return value(symbol)
+    if isinstance(value, Mapping):
+        return value.get(symbol)
+    return value
+
+
 def reconcile_database(
     database_path: Path,
     *,
@@ -424,71 +534,195 @@ def reconcile_database(
     batch_candles: int,
     end_lag_ms: int = 0,
     min_start_ms: int | None = None,
+    start_ms: int | Mapping[str, int] | Callable[[str], int | None] | None = None,
+    active_symbols: set[str] | None = None,
+    settlement_delay_ms: int = CANDLE_SETTLEMENT_DELAY_MS,
     write_queue_size: int = 32,
 ) -> int:
-    """Repair internal gaps in one existing timeframe DuckDB database."""
+    """Validate and atomically repair complete symbol histories in one database."""
     if not database_path.exists():
         return 0
     if interval not in INTERVAL_MS:
         raise ValueError(f"unsupported interval {interval!r}")
 
-    interval_ms = INTERVAL_MS[interval]
-    complete_before = complete_before_ms(end_lag_ms)
-    inserted_batches = 0
+    complete_end = settled_candle_end_ms(
+        interval,
+        utc_now_ms() - end_lag_ms,
+        settlement_delay_ms=settlement_delay_ms,
+    )
+    repaired_symbols = 0
+    active_keys = {symbol.upper() for symbol in active_symbols} if active_symbols is not None else None
 
     with DuckDBPriceWriter(
         database_path,
         queue_size=write_queue_size,
         migrate_legacy=False,
     ) as writer:
-        by_symbol = writer.symbols_and_open_times(
-            interval_ms=interval_ms,
-            complete_before_ms=complete_before,
-        )
-        for symbol, open_times in by_symbol.items():
-            gaps = detect_gaps(open_times, interval_ms)
-            symbol_failed = False
-            for gap_start_ms, gap_end_ms in gaps:
-                request_start_ms = gap_start_ms
+        for symbol in writer.list_symbols():
+            try:
+                original_rows = writer.read_symbol_rows(symbol)
+                valid_by_open: dict[int, list[object]] = {}
+                invalid_aligned_opens: set[int] = set()
+                invalid_count = 0
+                for row in original_rows:
+                    try:
+                        open_ms, output = _stored_row_to_output(
+                            row,
+                            symbol=symbol,
+                            interval=interval,
+                            complete_end=complete_end,
+                        )
+                        valid_by_open[open_ms] = output
+                    except Exception:
+                        invalid_count += 1
+                        try:
+                            raw_open = row[0]
+                            if isinstance(raw_open, datetime):
+                                if raw_open.tzinfo is None:
+                                    raw_open = raw_open.replace(tzinfo=timezone.utc)
+                                bad_open_ms = dt_to_ms(raw_open.astimezone(timezone.utc))
+                                if (
+                                    is_candle_open_aligned(bad_open_ms, interval)
+                                    and bad_open_ms < complete_end
+                                ):
+                                    invalid_aligned_opens.add(bad_open_ms)
+                        except Exception:
+                            pass
+
+                valid_opens = sorted(valid_by_open)
+                configured_start = _symbol_setting(start_ms, symbol)
+                if configured_start is None:
+                    configured_start = valid_opens[0] if valid_opens else dt_to_ms(DEFAULT_START_DT)
+                configured_start = floor_to_candle_boundary(interval, int(configured_start))
                 if min_start_ms is not None:
-                    request_start_ms = max(request_start_ms, min_start_ms)
-                if request_start_ms >= gap_end_ms:
+                    configured_start = max(
+                        configured_start,
+                        ceil_to_candle_boundary(interval, min_start_ms),
+                    )
+                if valid_opens and configured_start > valid_opens[0]:
+                    raise KlineValidationError(
+                        f"possible symbol reuse: configured first boundary {configured_start} "
+                        f"is after stored first candle {valid_opens[0]}"
+                    )
+
+                cached_first_open_ms = writer.get_first_open_ms(symbol)
+                if cached_first_open_ms is not None and configured_start > cached_first_open_ms:
+                    raise KlineValidationError(
+                        f"possible symbol reuse: current listing boundary {configured_start} "
+                        f"is after cached first candle {cached_first_open_ms}"
+                    )
+
+                if cached_first_open_ms is None:
+                    discovery_end = (
+                        min(complete_end, next_candle_open_ms(valid_opens[0], interval))
+                        if valid_opens
+                        else complete_end
+                    )
+                    first_open_ms = _discover_first_available_open_ms(
+                        symbol,
+                        interval,
+                        configured_start,
+                        discovery_end,
+                        fetch_rows,
+                        batch_candles=batch_candles,
+                    )
+                    if first_open_ms is not None:
+                        writer.set_first_open_ms(symbol, first_open_ms)
+                else:
+                    first_open_ms = cached_first_open_ms
+                if first_open_ms is None:
+                    if valid_opens:
+                        raise KlineValidationError(
+                            f"provider returned no history through stored first candle {valid_opens[0]}"
+                        )
+                    continue
+                if valid_opens and first_open_ms > valid_opens[0]:
+                    raise KlineValidationError(
+                        f"possible symbol reuse: provider first candle {first_open_ms} "
+                        f"is after stored first candle {valid_opens[0]}"
+                    )
+
+                ranges: list[tuple[int, int]] = []
+                if not valid_opens:
+                    if active_keys is not None and symbol.upper() in active_keys:
+                        ranges.append((first_open_ms, complete_end))
+                else:
+                    if first_open_ms < valid_opens[0]:
+                        ranges.append((first_open_ms, valid_opens[0]))
+                    for previous, current in zip(valid_opens, valid_opens[1:]):
+                        expected = next_candle_open_ms(previous, interval)
+                        if current > expected:
+                            ranges.append((expected, current))
+                        elif current < expected:
+                            raise KlineValidationError(
+                                f"off-grid sequence {previous} -> {current}"
+                            )
+                    for bad_open_ms in invalid_aligned_opens:
+                        ranges.append((bad_open_ms, next_candle_open_ms(bad_open_ms, interval)))
+                    if active_keys is not None and symbol.upper() in active_keys:
+                        tail_start = next_candle_open_ms(valid_opens[-1], interval)
+                        if tail_start < complete_end:
+                            ranges.append((tail_start, complete_end))
+
+                ranges = _merge_repair_ranges(ranges)
+                if not ranges and invalid_count == 0:
                     continue
 
-                try:
+                fetched_rows: list[list[object]] = []
+                for range_start, range_end in ranges:
                     fetched = fetch_missing_range(
                         symbol,
                         interval,
-                        request_start_ms,
-                        gap_end_ms,
+                        range_start,
+                        range_end,
                         fetch_rows,
                         batch_candles=batch_candles,
-                        complete_before=complete_before,
+                        complete_before=complete_end,
                         min_start_ms=min_start_ms,
                         sleep_between_calls=0,
                     )
-                except FetchWindowError as exc:
-                    result = exc.result
-                    print(
-                        f"[WARN] Deferred reconciliation window for {symbol} {interval} "
-                        f"{ms_to_utc_string(gap_start_ms)}..{ms_to_utc_string(gap_end_ms)} "
-                        f"({result.status.value}): {result.message}"
+                    fetched_rows.extend(
+                        fetched[OUTPUT_COLUMNS].itertuples(index=False, name=None)
                     )
-                    symbol_failed = True
-                    break
 
-                if fetched.empty:
-                    continue
-                writer.insert_output_rows(
-                    symbol,
-                    fetched[OUTPUT_COLUMNS].itertuples(index=False, name=None),
+                candidate = dict(valid_by_open)
+                for row in fetched_rows:
+                    candidate[utc_string_to_ms(str(row[0]))] = list(row)
+                candidate_opens = sorted(candidate)
+                if not candidate_opens:
+                    raise KlineValidationError("repair candidate contains no valid candles")
+
+                candidate_end = (
+                    complete_end
+                    if active_keys is not None and symbol.upper() in active_keys
+                    else next_candle_open_ms(candidate_opens[-1], interval)
                 )
-                inserted_batches += 1
+                expected = expected_open_times(first_open_ms, candidate_end, interval)
+                if candidate_opens != expected:
+                    raise KlineValidationError(
+                        f"repair candidate remains incomplete; expected {len(expected)} rows, "
+                        f"found {len(candidate_opens)}"
+                    )
 
-            if symbol_failed:
-                continue
+                writer.replace_symbol_rows(
+                    symbol,
+                    [candidate[open_ms] for open_ms in candidate_opens],
+                )
+                repaired_symbols += 1
+                print(
+                    f"[REPAIRED] {symbol} @ {interval}: "
+                    f"{invalid_count} invalid row(s), {len(ranges)} range(s)."
+                )
+            except FetchWindowError as exc:
+                result = exc.result
+                print(
+                    f"[WARN] Deferred atomic reconciliation for {symbol} {interval} "
+                    f"({result.status.value}): {result.message}"
+                )
+            except Exception as exc:
+                print(f"[WARN] Deferred atomic reconciliation for {symbol} {interval}: {exc}")
 
-    return inserted_batches
+    return repaired_symbols
 
 
 def reconcile_existing_databases(
@@ -499,6 +733,9 @@ def reconcile_existing_databases(
     batch_candles: int | Callable[[str, Any], int],
     min_start_ms: int | Callable[[str, Any], int | None] | None = None,
     end_lag_ms: int | Callable[[str, Any], int] = 0,
+    start_ms: Any = None,
+    active_symbols: set[str] | None = None,
+    settlement_delay_ms: int = CANDLE_SETTLEMENT_DELAY_MS,
     write_queue_size: int = 32,
 ) -> None:
     exchange_dir = FUTURES_DATA_DIR / exchange.lower()
@@ -517,6 +754,16 @@ def reconcile_existing_databases(
                 batch_candles=int(_value_for_interval(batch_candles, interval, api_interval)),
                 min_start_ms=_value_for_interval(min_start_ms, interval, api_interval),
                 end_lag_ms=int(_value_for_interval(end_lag_ms, interval, api_interval) or 0),
+                start_ms=(
+                    lambda symbol, interval=interval, api_interval=api_interval: _value_for_symbol_interval(
+                        start_ms,
+                        interval,
+                        api_interval,
+                        symbol,
+                    )
+                ),
+                active_symbols=active_symbols,
+                settlement_delay_ms=settlement_delay_ms,
                 write_queue_size=write_queue_size,
             )
         except Exception as exc:
@@ -526,6 +773,22 @@ def reconcile_existing_databases(
 def _value_for_interval(value_or_func: Any, interval: str, api_interval: Any) -> Any:
     if callable(value_or_func):
         return value_or_func(interval, api_interval)
+    return value_or_func
+
+
+def _value_for_symbol_interval(
+    value_or_func: Any,
+    interval: str,
+    api_interval: Any,
+    symbol: str,
+) -> Any:
+    if callable(value_or_func):
+        return value_or_func(interval, api_interval, symbol)
+    if isinstance(value_or_func, Mapping):
+        interval_value = value_or_func.get(interval)
+        if isinstance(interval_value, Mapping):
+            return interval_value.get(symbol)
+        return interval_value
     return value_or_func
 
 

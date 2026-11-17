@@ -139,7 +139,10 @@ class FuturesReconcileCommonTests(unittest.TestCase):
 
         def fetch_rows(symbol: str, start_ms: int, end_ms: int):
             calls.append((start_ms, end_ms))
-            return [[start_ms, "x", "x", "x", "x", "x"]]
+            return [
+                [open_ms, "1", "2", "0.5", "1.5", "10"]
+                for open_ms in range(start_ms, end_ms, interval_ms)
+            ]
 
         try:
             with patch.object(rc, "utc_now_ms", lambda: interval_ms * 7):
@@ -165,7 +168,10 @@ class FuturesReconcileCommonTests(unittest.TestCase):
 
         def fetch_rows(symbol: str, start_ms: int, end_ms: int):
             calls.append((start_ms, end_ms))
-            return [[start_ms, "x", "x", "x", "x", "x"]]
+            return [
+                [open_ms, "1", "2", "0.5", "1.5", "10"]
+                for open_ms in range(start_ms, end_ms, interval_ms)
+            ]
 
         rc.fetch_missing_range(
             "TESTUSDT",

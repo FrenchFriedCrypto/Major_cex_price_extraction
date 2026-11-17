@@ -15,7 +15,7 @@ Read these before editing:
 - `get_futures_data/01_futures_bybit.py`
 - `get_futures_data/01_futures_coinw.py`
 - `get_futures_data/01_futures_gateio.py`
-- `get_futures_data/01_futures_hyperliquid.py`
+- `get_futures_data/deprecated/01_futures_hyperliquid.py`
 - `get_futures_data/01_futures_mexc.py`
 - `get_futures_data/01_futures_okx.py`
 - `get_futures_data/01_futures_weex.py`

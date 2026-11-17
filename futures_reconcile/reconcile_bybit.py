@@ -146,7 +146,7 @@ def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> 
         "symbol": symbol,
         "interval": api_interval,
         "start": start_ms,
-        "end": end_ms,
+        "end": end_ms - 1,
         "limit": KLINE_LIMIT,
     }
     request_result = request_bybit_kline(symbol, params)

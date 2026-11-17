@@ -74,6 +74,8 @@ class BitgetRequestWindowTests(unittest.TestCase):
 
         with (
             patch.object(bitget, "INTERVALS", {"1w": "1W", "1M": "1M"}),
+            patch.object(bitget, "refresh_symbols", lambda: None),
+            patch.object(bitget, "reconcile_data", lambda *args, **kwargs: None),
             patch.object(bitget, "load_delisted_symbols", lambda exchange: set()),
             patch.object(bitget, "load_symbols", lambda csv_filename: ["BTCUSDT"]),
             patch.object(bitget, "process_symbol", fake_process_symbol),

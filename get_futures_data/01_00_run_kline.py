@@ -8,7 +8,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 ACTIVE_SCRIPTS = [
     "01_futures_bybit.py",
-    "01_futures_hyperliquid.py",
     "01_futures_mexc.py",
     "01_futures_bitget.py",
 ]

@@ -23,7 +23,10 @@ def load_module(name: str, path: Path):
     return module
 
 
-hyperliquid = load_module("rate_limit_test_hyperliquid", FUTURES_DIR / "01_futures_hyperliquid.py")
+hyperliquid = load_module(
+    "rate_limit_test_hyperliquid",
+    FUTURES_DIR / "deprecated" / "01_futures_hyperliquid.py",
+)
 
 
 class FakeClock:

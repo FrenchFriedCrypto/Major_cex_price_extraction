@@ -6,7 +6,7 @@ import io
 import shutil
 import sys
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -165,7 +165,9 @@ class FuturesQuietOutputTests(unittest.TestCase):
         start_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
         start_ms = futures_common.dt_to_ms(start_dt)
         interval_ms = futures_common.INTERVAL_MS["1m"]
-        available_until_ms = start_ms + interval_ms
+        available_until_ms = (
+            start_ms + interval_ms + futures_common.CANDLE_SETTLEMENT_DELAY_MS
+        )
 
         def fake_fetch(symbol, start_ms_arg, end_ms_arg):
             return [[start_ms, "1", "2", "0.5", "1.5", "100"]]
@@ -213,7 +215,9 @@ class FuturesQuietOutputTests(unittest.TestCase):
         start_ms = futures_common.dt_to_ms(start_dt)
         interval_ms = futures_common.INTERVAL_MS["1m"]
         min_start_ms = start_ms + interval_ms * 3
-        available_until_ms = min_start_ms + interval_ms
+        available_until_ms = (
+            min_start_ms + interval_ms + futures_common.CANDLE_SETTLEMENT_DELAY_MS
+        )
         calls = []
 
         def fake_fetch(symbol, start_ms_arg, end_ms_arg):
@@ -279,7 +283,7 @@ class FuturesQuietOutputTests(unittest.TestCase):
 
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "")
-        self.assertEqual(calls, [("TESTUSDT", min_start_ms, available_until_ms)])
+        self.assertEqual(calls, [("TESTUSDT", min_start_ms, min_start_ms + interval_ms)])
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[-1][0], datetime.fromtimestamp(min_start_ms / 1000, tz=timezone.utc).replace(tzinfo=None))
         self.assertEqual(migrated_csv, original_csv)
@@ -458,7 +462,11 @@ class FuturesQuietOutputTests(unittest.TestCase):
     def test_fresh_process_does_not_create_price_history_csv(self):
         start_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
         start_ms = futures_common.dt_to_ms(start_dt)
-        available_until_ms = start_ms + futures_common.INTERVAL_MS["1m"]
+        available_until_ms = (
+            start_ms
+            + futures_common.INTERVAL_MS["1m"]
+            + futures_common.CANDLE_SETTLEMENT_DELAY_MS
+        )
         futures_data_dir = reset_workspace_dir("_duckdb_no_fresh_csv")
         try:
             with (
@@ -534,7 +542,6 @@ class FuturesQuietOutputTests(unittest.TestCase):
         for module_name, filename, api_interval in (
             ("quiet_test_bitget_exchange", "01_futures_bitget.py", "5m"),
             ("quiet_test_bybit_exchange", "01_futures_bybit.py", "5"),
-            ("quiet_test_hyperliquid_exchange", "01_futures_hyperliquid.py", "5m"),
             ("quiet_test_mexc_exchange", "01_futures_mexc.py", "Min5"),
         ):
             with self.subTest(filename=filename):
@@ -554,21 +561,17 @@ class FuturesQuietOutputTests(unittest.TestCase):
                         lambda *args, **kwargs: process_calls.append((args, kwargs)),
                     ),
                 ]
-                if filename == "01_futures_hyperliquid.py":
+                if hasattr(module, "refresh_symbols"):
+                    patches.append(patch.object(module, "refresh_symbols", lambda: None))
+                if hasattr(module, "reconcile_data"):
                     patches.append(
-                        patch.object(
-                            module,
-                            "recent_start_dt",
-                            lambda interval: datetime(2026, 1, 1, tzinfo=timezone.utc),
-                        )
+                        patch.object(module, "reconcile_data", lambda *args, **kwargs: None)
                     )
 
-                with patches[0], patches[1], patches[2], patches[3]:
-                    if len(patches) == 5:
-                        with patches[4]:
-                            module.main()
-                    else:
-                        module.main()
+                with ExitStack() as stack:
+                    for configured_patch in patches:
+                        stack.enter_context(configured_patch)
+                    module.main()
 
                 self.assertEqual(len(process_calls), 1)
                 self.assertEqual(process_calls[0][0][2], module.EXCHANGE)

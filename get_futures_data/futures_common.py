@@ -1,9 +1,13 @@
 import csv
 import email.utils
+import math
+import os
 import queue
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -48,6 +52,9 @@ BATCH_CANDLES = 1000
 RETRYABLE_STATUS_CODES = {400, 418, 429}
 COLLECTOR_NETWORK_WORKERS = 1
 DATABASE_WRITE_QUEUE_SIZE = 32
+CANDLE_SETTLEMENT_DELAY_MS = 30_000
+_LOCAL_FILE_LOCKS_GUARD = threading.Lock()
+_LOCAL_FILE_LOCKS: dict[str, threading.Lock] = {}
 
 
 class RequestStatus(str, Enum):
@@ -166,6 +173,28 @@ CREATE TABLE IF NOT EXISTS legacy_csv_imports (
 )
 """
 
+SYMBOL_HISTORY_METADATA_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS symbol_history_metadata (
+    "Symbol" VARCHAR PRIMARY KEY,
+    "First open time" TIMESTAMP NOT NULL,
+    "Verified at" TIMESTAMP NOT NULL
+)
+"""
+
+SYMBOL_UPDATE_STAGING_TABLE_SQL = """
+CREATE TEMP TABLE IF NOT EXISTS symbol_update_staging (
+    "Stage id" VARCHAR NOT NULL,
+    "Symbol" VARCHAR NOT NULL,
+    "Open time" TIMESTAMP NOT NULL,
+    "Open" DOUBLE,
+    "High" DOUBLE,
+    "Low" DOUBLE,
+    "Close" DOUBLE,
+    "Volume" DOUBLE,
+    "Close time" TIMESTAMP NOT NULL
+)
+"""
+
 INSERT_PRICE_HISTORY_SQL = """
 INSERT INTO price_history (
     "Symbol",
@@ -205,6 +234,36 @@ FROM _price_history_batch
 ON CONFLICT ("Symbol", "Open time") DO NOTHING
 """
 
+BULK_UPSERT_PRICE_HISTORY_SQL = """
+INSERT INTO price_history (
+    "Symbol",
+    "Open time",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "Close time"
+)
+SELECT
+    "Symbol",
+    "Open time",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "Close time"
+FROM _price_history_batch
+ON CONFLICT ("Symbol", "Open time") DO UPDATE SET
+    "Open" = EXCLUDED."Open",
+    "High" = EXCLUDED."High",
+    "Low" = EXCLUDED."Low",
+    "Close" = EXCLUDED."Close",
+    "Volume" = EXCLUDED."Volume",
+    "Close time" = EXCLUDED."Close time"
+"""
+
 
 INTERVAL_MS = {
     "1m": 60_000,
@@ -223,6 +282,230 @@ INTERVAL_MS = {
     "1w": 604_800_000,
     "1M": 2_592_000_000,
 }
+
+
+class KlineValidationError(ValueError):
+    """A provider response or stored candle violates the expected candle grid."""
+
+
+@contextmanager
+def interprocess_file_lock(
+    target: str | Path,
+    *,
+    timeout_seconds: float = 3600,
+):
+    """Hold one OS-backed lock across collection and reconciliation."""
+    lock_path = Path(target)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_key = os.path.normcase(str(lock_path.resolve()))
+    with _LOCAL_FILE_LOCKS_GUARD:
+        local_lock = _LOCAL_FILE_LOCKS.setdefault(lock_key, threading.Lock())
+    if not local_lock.acquire(timeout=timeout_seconds):
+        raise TimeoutError(f"Timed out waiting for local file lock: {lock_path}")
+
+    lock_file = None
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        lock_file = lock_path.open("a+b")
+        lock_file.seek(0)
+        if lock_file.read(1) == b"":
+            lock_file.seek(0)
+            lock_file.write(b"\0")
+            lock_file.flush()
+
+        while True:
+            try:
+                lock_file.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for file lock: {lock_path}")
+                time.sleep(0.1)
+
+        try:
+            yield lock_path
+        finally:
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        if lock_file is not None:
+            lock_file.close()
+        local_lock.release()
+
+
+def exchange_dataset_lock_path(exchange: str) -> Path:
+    return FUTURES_DATA_DIR / exchange.lower() / ".price_history_maintenance.lock"
+
+
+def floor_to_candle_boundary(interval: str, timestamp_ms: int) -> int:
+    timestamp_ms = int(timestamp_ms)
+    dt_value = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    if interval == "1M":
+        return dt_to_ms(datetime(dt_value.year, dt_value.month, 1, tzinfo=timezone.utc))
+    if interval == "1w":
+        day_start = datetime(dt_value.year, dt_value.month, dt_value.day, tzinfo=timezone.utc)
+        return dt_to_ms(day_start) - day_start.weekday() * INTERVAL_MS["1d"]
+    interval_ms = INTERVAL_MS[interval]
+    return timestamp_ms - timestamp_ms % interval_ms
+
+
+def next_candle_open_ms(open_ms: int, interval: str) -> int:
+    open_ms = int(open_ms)
+    if interval != "1M":
+        return open_ms + INTERVAL_MS[interval]
+    dt_value = datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc)
+    year = dt_value.year + (1 if dt_value.month == 12 else 0)
+    month = 1 if dt_value.month == 12 else dt_value.month + 1
+    return dt_to_ms(datetime(year, month, 1, tzinfo=timezone.utc))
+
+
+def advance_candle_open_ms(open_ms: int, interval: str, candles: int) -> int:
+    if interval != "1M":
+        return int(open_ms) + max(0, int(candles)) * INTERVAL_MS[interval]
+    value = int(open_ms)
+    for _ in range(max(0, int(candles))):
+        value = next_candle_open_ms(value, interval)
+    return value
+
+
+def ceil_to_candle_boundary(interval: str, timestamp_ms: int) -> int:
+    boundary_ms = floor_to_candle_boundary(interval, timestamp_ms)
+    if boundary_ms == int(timestamp_ms):
+        return boundary_ms
+    return next_candle_open_ms(boundary_ms, interval)
+
+
+def is_candle_open_aligned(open_ms: int, interval: str) -> bool:
+    try:
+        return floor_to_candle_boundary(interval, int(open_ms)) == int(open_ms)
+    except (KeyError, OSError, OverflowError, ValueError):
+        return False
+
+
+def candle_close_ms(open_ms: int, interval: str) -> int:
+    return next_candle_open_ms(open_ms, interval) - 1
+
+
+def settled_candle_end_ms(
+    interval: str,
+    now_ms: int,
+    *,
+    settlement_delay_ms: int = CANDLE_SETTLEMENT_DELAY_MS,
+) -> int:
+    return floor_to_candle_boundary(interval, int(now_ms) - int(settlement_delay_ms))
+
+
+def expected_open_times(start_ms: int, end_ms: int, interval: str) -> list[int]:
+    start_ms = int(start_ms)
+    end_ms = int(end_ms)
+    if not is_candle_open_aligned(start_ms, interval):
+        raise KlineValidationError(f"off-grid {interval} range start {start_ms}")
+    expected: list[int] = []
+    cursor = start_ms
+    while cursor < end_ms:
+        expected.append(cursor)
+        next_ms = next_candle_open_ms(cursor, interval)
+        if next_ms <= cursor:
+            raise KlineValidationError(f"{interval} candle grid made no progress from {cursor}")
+        cursor = next_ms
+    if cursor != end_ms:
+        raise KlineValidationError(f"off-grid {interval} range end {end_ms}")
+    return expected
+
+
+def _strict_float(value: object, field: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise KlineValidationError(f"invalid {field}: {value!r}") from exc
+    if not math.isfinite(number):
+        raise KlineValidationError(f"nonfinite {field}: {value!r}")
+    return number
+
+
+def validate_raw_kline_rows(
+    rows: Iterable[Sequence[object]],
+    *,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    require_full_window: bool = True,
+) -> list[list[object]]:
+    """Validate, order, deduplicate, and convert one provider candle window."""
+    by_open: dict[int, tuple[float, float, float, float, float]] = {}
+    for row in rows:
+        if len(row) < 6:
+            raise KlineValidationError(f"bad row shape for {symbol} {interval}: {row!r}")
+        try:
+            open_ms = int(float(row[0]))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise KlineValidationError(
+                f"bad open time for {symbol} {interval}: {row!r}"
+            ) from exc
+        if open_ms < start_ms or open_ms >= end_ms:
+            raise KlineValidationError(
+                f"{symbol} {interval} returned {open_ms} outside [{start_ms}, {end_ms})"
+            )
+        if not is_candle_open_aligned(open_ms, interval):
+            raise KlineValidationError(f"off-grid {symbol} {interval} candle {open_ms}")
+
+        open_value = _strict_float(row[1], "open")
+        high = _strict_float(row[2], "high")
+        low = _strict_float(row[3], "low")
+        close = _strict_float(row[4], "close")
+        volume = _strict_float(row[5], "volume")
+        if min(open_value, high, low, close) <= 0:
+            raise KlineValidationError(f"nonpositive price for {symbol} {interval} at {open_ms}")
+        if volume < 0:
+            raise KlineValidationError(f"negative volume for {symbol} {interval} at {open_ms}")
+        if high < max(open_value, close, low) or low > min(open_value, close, high):
+            raise KlineValidationError(
+                f"invalid OHLC relationship for {symbol} {interval} at {open_ms}"
+            )
+
+        values = (open_value, high, low, close, volume)
+        previous = by_open.get(open_ms)
+        if previous is not None and previous != values:
+            raise KlineValidationError(
+                f"conflicting duplicate for {symbol} {interval} at {open_ms}"
+            )
+        by_open[open_ms] = values
+
+    opens = sorted(by_open)
+    if require_full_window:
+        expected = expected_open_times(start_ms, end_ms, interval)
+        if opens != expected:
+            missing = sorted(set(expected) - set(opens))
+            extra = sorted(set(opens) - set(expected))
+            raise KlineValidationError(
+                f"incomplete {symbol} {interval} response for [{start_ms}, {end_ms}); "
+                f"missing={missing[:5]}, extra={extra[:5]}"
+            )
+
+    return [
+        [
+            ms_to_utc_string(open_ms),
+            *by_open[open_ms],
+            ms_to_utc_string(candle_close_ms(open_ms, interval)),
+        ]
+        for open_ms in opens
+    ]
 
 
 def print_retry(reason: str, attempt: int, delay_seconds: float, max_retries: int = MAX_RETRIES) -> None:
@@ -545,6 +828,96 @@ def load_symbols(csv_filename: str, preserve_case: bool = False) -> list[str]:
     return symbols
 
 
+def normalize_symbols(symbols: Iterable[object], preserve_case: bool = False) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        raw_value = str(raw_symbol).strip()
+        value = raw_value if preserve_case else raw_value.upper()
+        if not raw_value or raw_value.upper() == "SYMBOL" or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _load_existing_symbols(csv_path: Path, preserve_case: bool = False) -> set[str]:
+    if not csv_path.exists():
+        return set()
+
+    existing: set[str] = set()
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+            for row in csv.reader(csv_file):
+                if not row:
+                    continue
+                raw_value = row[0].strip()
+                value = raw_value if preserve_case else raw_value.upper()
+                if raw_value and raw_value.upper() != "SYMBOL":
+                    existing.add(value)
+    except OSError as exc:
+        print(f"[WARN] Could not read {csv_path}. Proceeding as if empty. Error: {exc}")
+    return existing
+
+
+def _delisted_csv_path(csv_filename: str) -> Path:
+    source = Path(csv_filename)
+    stem = source.stem
+    if stem.endswith("_symbols"):
+        stem = f"{stem.removesuffix('_symbols')}_delisted_symbols"
+    else:
+        stem = f"{stem}_delisted_symbols"
+    return SYMBOLS_DIR / DELISTED_DIR_NAME / f"{stem}{source.suffix or '.csv'}"
+
+
+def update_symbol_files(
+    csv_filename: str,
+    symbols: Iterable[object],
+    preserve_case: bool = False,
+    replace_source: bool = False,
+) -> None:
+    """Merge a fresh exchange symbol snapshot into the active and delisted CSVs."""
+    current_symbols = normalize_symbols(symbols, preserve_case=preserve_case)
+    if not current_symbols:
+        print("[WARN] No symbols matched the requested filter.")
+        return
+
+    SYMBOLS_DIR.mkdir(parents=True, exist_ok=True)
+    source_path = SYMBOLS_DIR / csv_filename
+    existing_symbols = _load_existing_symbols(source_path, preserve_case=preserve_case)
+    current_keys = set(current_symbols)
+
+    delisted_path = _delisted_csv_path(csv_filename)
+    already_delisted = _load_existing_symbols(delisted_path, preserve_case=preserve_case)
+    newly_delisted = sorted(existing_symbols - current_keys - already_delisted)
+    if newly_delisted:
+        delisted_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with delisted_path.open(
+                "a" if delisted_path.exists() else "w",
+                newline="",
+                encoding="utf-8",
+            ) as csv_file:
+                csv.writer(csv_file).writerows([symbol] for symbol in newly_delisted)
+        except OSError as exc:
+            print(f"[ERROR] Error writing delisted symbols to {delisted_path}: {exc}")
+
+    if replace_source:
+        symbols_to_write = current_symbols
+        mode = "w"
+    else:
+        symbols_to_write = [symbol for symbol in current_symbols if symbol not in existing_symbols]
+        mode = "a" if source_path.exists() else "w"
+
+    if not symbols_to_write:
+        return
+    try:
+        with source_path.open(mode, newline="", encoding="utf-8") as csv_file:
+            csv.writer(csv_file).writerows([symbol] for symbol in symbols_to_write)
+    except OSError as exc:
+        print(f"[ERROR] Error writing symbols to {source_path}: {exc}")
+
+
 def symbol_metadata_path(csv_filename: str) -> Path:
     source = Path(csv_filename)
     return SYMBOLS_DIR / f"{source.stem}_metadata.csv"
@@ -593,6 +966,45 @@ def load_symbol_listing_times(
     return listing_times
 
 
+def update_symbol_listing_metadata(
+    csv_filename: str,
+    listing_times_ms: Mapping[object, object],
+    *,
+    preserve_case: bool = False,
+) -> None:
+    """Merge exchange-supplied listing timestamps into the symbol metadata CSV."""
+    SYMBOLS_DIR.mkdir(parents=True, exist_ok=True)
+    metadata_path = symbol_metadata_path(csv_filename)
+    merged = load_symbol_listing_times(csv_filename, preserve_case=preserve_case)
+
+    for raw_symbol, raw_time in listing_times_ms.items():
+        symbol_text = str(raw_symbol).strip()
+        if not symbol_text:
+            continue
+        try:
+            listing_time_ms = int(str(raw_time).strip())
+        except (TypeError, ValueError):
+            continue
+        if listing_time_ms < 0:
+            continue
+        key = symbol_text if preserve_case else symbol_text.upper()
+        merged[key] = listing_time_ms
+
+    if not merged:
+        return
+
+    tmp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", newline="", encoding="utf-8") as metadata_file:
+            writer = csv.writer(metadata_file)
+            writer.writerow(["Symbol", "Listing time ms"])
+            for symbol, listing_time_ms in sorted(merged.items()):
+                writer.writerow([symbol, listing_time_ms])
+        os.replace(tmp_path, metadata_path)
+    except OSError as exc:
+        print(f"[ERROR] Error writing listing metadata to {metadata_path}: {exc}")
+
+
 def start_dt_with_listing_time(
     default_start_dt: datetime,
     listing_time_ms: int | None,
@@ -601,6 +1013,50 @@ def start_dt_with_listing_time(
         return default_start_dt
     listing_dt = datetime.fromtimestamp(listing_time_ms / 1000, tz=timezone.utc)
     return max(default_start_dt, listing_dt)
+
+
+def full_history_start_dt(
+    default_start_dt: datetime,
+    listing_time_ms: int | None,
+) -> datetime:
+    """Use an exchange listing timestamp even when it predates the legacy 2023 floor."""
+    if listing_time_ms is None:
+        return default_start_dt
+    return datetime.fromtimestamp(listing_time_ms / 1000, tz=timezone.utc)
+
+
+def aligned_full_history_start_dt(
+    default_start_dt: datetime,
+    listing_time_ms: int | None,
+    interval: str,
+) -> datetime:
+    """Align an actual listing down, but keep a fallback cutoff from moving earlier."""
+    raw_start = full_history_start_dt(default_start_dt, listing_time_ms)
+    raw_start_ms = dt_to_ms(raw_start)
+    if listing_time_ms is None:
+        boundary_ms = ceil_to_candle_boundary(interval, raw_start_ms)
+    else:
+        boundary_ms = floor_to_candle_boundary(interval, raw_start_ms)
+    return datetime.fromtimestamp(boundary_ms / 1000, tz=timezone.utc)
+
+
+def coerce_epoch_ms(value: object) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        timestamp_ms = int(float(text))
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return dt_to_ms(parsed.astimezone(timezone.utc))
+    if 0 < timestamp_ms < 100_000_000_000:
+        timestamp_ms *= 1000
+    return timestamp_ms if timestamp_ms > 0 else None
 
 
 def load_delisted_symbols(exchange: str) -> set[str]:
@@ -639,6 +1095,7 @@ def get_output_db_path(exchange: str, timeframe: str) -> Path:
 def _create_database_tables(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(PRICE_HISTORY_TABLE_SQL)
     connection.execute(LEGACY_CSV_IMPORTS_TABLE_SQL)
+    connection.execute(SYMBOL_HISTORY_METADATA_TABLE_SQL)
 
 
 def _parse_utc_timestamp(value: object) -> datetime:
@@ -703,6 +1160,42 @@ def _bulk_insert_prepared(
         connection.execute(BULK_INSERT_PRICE_HISTORY_SQL)
     finally:
         connection.unregister("_price_history_batch")
+
+
+def _bulk_upsert_prepared(
+    connection: duckdb.DuckDBPyConnection,
+    prepared_rows: Sequence[Sequence[object]],
+) -> None:
+    if not prepared_rows:
+        return
+    columns = ["Symbol", *OUTPUT_COLUMNS]
+    frame = pd.DataFrame.from_records(prepared_rows, columns=columns)
+    connection.register("_price_history_batch", frame)
+    try:
+        connection.execute(BULK_UPSERT_PRICE_HISTORY_SQL)
+    finally:
+        connection.unregister("_price_history_batch")
+
+
+def _bulk_stage_prepared(
+    connection: duckdb.DuckDBPyConnection,
+    stage_id: str,
+    prepared_rows: Sequence[Sequence[object]],
+) -> None:
+    if not prepared_rows:
+        return
+    columns = ["Stage id", "Symbol", *OUTPUT_COLUMNS]
+    frame = pd.DataFrame.from_records(
+        [(stage_id, *row) for row in prepared_rows],
+        columns=columns,
+    )
+    connection.register("_price_history_stage_batch", frame)
+    try:
+        connection.execute(
+            "INSERT INTO symbol_update_staging SELECT * FROM _price_history_stage_batch"
+        )
+    finally:
+        connection.unregister("_price_history_stage_batch")
 
 
 def migrate_legacy_csvs(
@@ -800,6 +1293,12 @@ class DuckDBPriceWriter:
     def get_last_open_ms(self, symbol: str) -> int | None:
         return self._submit("get_last_open_ms", symbol)  # type: ignore[return-value]
 
+    def get_first_open_ms(self, symbol: str) -> int | None:
+        return self._submit("get_first_open_ms", symbol)  # type: ignore[return-value]
+
+    def set_first_open_ms(self, symbol: str, first_open_ms: int) -> None:
+        self._submit("set_first_open_ms", symbol, int(first_open_ms))
+
     def insert_output_rows(
         self,
         symbol: str,
@@ -808,6 +1307,54 @@ class DuckDBPriceWriter:
         prepared_rows = tuple(_prepare_price_row(symbol, row) for row in rows)
         if prepared_rows:
             self._submit("insert_prepared", prepared_rows)
+
+    def upsert_output_rows(
+        self,
+        symbol: str,
+        rows: Iterable[Sequence[object]],
+    ) -> None:
+        prepared_rows = tuple(_prepare_price_row(symbol, row) for row in rows)
+        if prepared_rows:
+            self._submit("upsert_prepared", prepared_rows)
+
+    def start_symbol_stage(self) -> str:
+        return uuid.uuid4().hex
+
+    def stage_output_rows(
+        self,
+        stage_id: str,
+        symbol: str,
+        rows: Iterable[Sequence[object]],
+    ) -> None:
+        prepared_rows = tuple(_prepare_price_row(symbol, row) for row in rows)
+        if prepared_rows:
+            self._submit("stage_prepared", stage_id, prepared_rows)
+
+    def commit_symbol_stage(
+        self,
+        stage_id: str,
+        symbol: str,
+        *,
+        first_open_ms: int | None = None,
+    ) -> None:
+        self._submit("commit_symbol_stage", stage_id, symbol, first_open_ms)
+
+    def discard_symbol_stage(self, stage_id: str) -> None:
+        self._submit("discard_symbol_stage", stage_id)
+
+    def list_symbols(self) -> list[str]:
+        return self._submit("list_symbols")  # type: ignore[return-value]
+
+    def read_symbol_rows(self, symbol: str) -> list[tuple[object, ...]]:
+        return self._submit("read_symbol_rows", symbol)  # type: ignore[return-value]
+
+    def replace_symbol_rows(
+        self,
+        symbol: str,
+        rows: Iterable[Sequence[object]],
+    ) -> None:
+        prepared_rows = tuple(_prepare_price_row(symbol, row) for row in rows)
+        self._submit("replace_symbol_rows", symbol, prepared_rows)
 
     def symbols_and_open_times(
         self,
@@ -840,6 +1387,7 @@ class DuckDBPriceWriter:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
             connection = duckdb.connect(str(self.database_path))
             _create_database_tables(connection)
+            connection.execute(SYMBOL_UPDATE_STAGING_TABLE_SQL)
             if self.migrate_legacy:
                 migrate_legacy_csvs(self.database_path, connection)
         except BaseException as exc:
@@ -881,10 +1429,155 @@ class DuckDBPriceWriter:
                 last_open = _parse_utc_timestamp(last_open)
             return dt_to_ms(last_open.replace(tzinfo=timezone.utc))
 
+        if command.operation == "get_first_open_ms":
+            result = connection.execute(
+                'SELECT "First open time" FROM symbol_history_metadata WHERE "Symbol" = ?',
+                [command.arguments[0]],
+            ).fetchone()
+            if result is None or result[0] is None:
+                return None
+            first_open = result[0]
+            if not isinstance(first_open, datetime):
+                first_open = _parse_utc_timestamp(first_open)
+            return dt_to_ms(first_open.replace(tzinfo=timezone.utc))
+
+        if command.operation == "set_first_open_ms":
+            symbol = str(command.arguments[0])
+            first_open = datetime.fromtimestamp(
+                int(command.arguments[1]) / 1000,
+                tz=timezone.utc,
+            ).replace(tzinfo=None)
+            connection.execute(
+                """
+                INSERT INTO symbol_history_metadata ("Symbol", "First open time", "Verified at")
+                VALUES (?, ?, ?)
+                ON CONFLICT ("Symbol") DO UPDATE SET
+                    "First open time" = EXCLUDED."First open time",
+                    "Verified at" = EXCLUDED."Verified at"
+                """,
+                [symbol, first_open, datetime.now(timezone.utc).replace(tzinfo=None)],
+            )
+            return None
+
         if command.operation == "insert_prepared":
             prepared_rows = command.arguments[0]
             connection.execute("BEGIN TRANSACTION")
             try:
+                _bulk_insert_prepared(connection, prepared_rows)  # type: ignore[arg-type]
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return None
+
+        if command.operation == "upsert_prepared":
+            prepared_rows = command.arguments[0]
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                _bulk_upsert_prepared(connection, prepared_rows)  # type: ignore[arg-type]
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return None
+
+        if command.operation == "stage_prepared":
+            _bulk_stage_prepared(
+                connection,
+                str(command.arguments[0]),
+                command.arguments[1],  # type: ignore[arg-type]
+            )
+            return None
+
+        if command.operation == "commit_symbol_stage":
+            stage_id = str(command.arguments[0])
+            symbol = str(command.arguments[1])
+            first_open_ms = command.arguments[2]
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO price_history (
+                        "Symbol", "Open time", "Open", "High", "Low",
+                        "Close", "Volume", "Close time"
+                    )
+                    SELECT
+                        "Symbol", "Open time", "Open", "High", "Low",
+                        "Close", "Volume", "Close time"
+                    FROM symbol_update_staging
+                    WHERE "Stage id" = ? AND "Symbol" = ?
+                    ON CONFLICT ("Symbol", "Open time") DO UPDATE SET
+                        "Open" = EXCLUDED."Open",
+                        "High" = EXCLUDED."High",
+                        "Low" = EXCLUDED."Low",
+                        "Close" = EXCLUDED."Close",
+                        "Volume" = EXCLUDED."Volume",
+                        "Close time" = EXCLUDED."Close time"
+                    """,
+                    [stage_id, symbol],
+                )
+                if first_open_ms is not None:
+                    first_open = datetime.fromtimestamp(
+                        int(first_open_ms) / 1000,
+                        tz=timezone.utc,
+                    ).replace(tzinfo=None)
+                    connection.execute(
+                        """
+                        INSERT INTO symbol_history_metadata
+                            ("Symbol", "First open time", "Verified at")
+                        VALUES (?, ?, ?)
+                        ON CONFLICT ("Symbol") DO UPDATE SET
+                            "First open time" = EXCLUDED."First open time",
+                            "Verified at" = EXCLUDED."Verified at"
+                        """,
+                        [
+                            symbol,
+                            first_open,
+                            datetime.now(timezone.utc).replace(tzinfo=None),
+                        ],
+                    )
+                connection.execute(
+                    'DELETE FROM symbol_update_staging WHERE "Stage id" = ?',
+                    [stage_id],
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return None
+
+        if command.operation == "discard_symbol_stage":
+            connection.execute(
+                'DELETE FROM symbol_update_staging WHERE "Stage id" = ?',
+                [str(command.arguments[0])],
+            )
+            return None
+
+        if command.operation == "list_symbols":
+            return [
+                str(row[0])
+                for row in connection.execute(
+                    'SELECT DISTINCT "Symbol" FROM price_history ORDER BY "Symbol"'
+                ).fetchall()
+            ]
+
+        if command.operation == "read_symbol_rows":
+            return connection.execute(
+                """
+                SELECT "Open time", "Open", "High", "Low", "Close", "Volume", "Close time"
+                FROM price_history
+                WHERE "Symbol" = ?
+                ORDER BY "Open time"
+                """,
+                [command.arguments[0]],
+            ).fetchall()
+
+        if command.operation == "replace_symbol_rows":
+            symbol = str(command.arguments[0])
+            prepared_rows = command.arguments[1]
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                connection.execute('DELETE FROM price_history WHERE "Symbol" = ?', [symbol])
                 _bulk_insert_prepared(connection, prepared_rows)  # type: ignore[arg-type]
                 connection.execute("COMMIT")
             except Exception:
@@ -1025,9 +1718,9 @@ def process_symbol(
     end_lag_ms: int = 0,
     min_start_ms: int | None = None,
     sleep_between_calls: float = 0.0,
+    settlement_delay_ms: int = CANDLE_SETTLEMENT_DELAY_MS,
     writer: DuckDBPriceWriter | None = None,
 ) -> bool:
-    interval_ms = INTERVAL_MS[interval]
     database_path = get_output_db_path(exchange, interval)
     if writer is None:
         with DuckDBPriceWriter(database_path) as owned_writer:
@@ -1041,70 +1734,131 @@ def process_symbol(
                 end_lag_ms=end_lag_ms,
                 min_start_ms=min_start_ms,
                 sleep_between_calls=sleep_between_calls,
+                settlement_delay_ms=settlement_delay_ms,
                 writer=owned_writer,
             )
 
     last_open_ms = get_last_open_ms(database_path, symbol, writer=writer)
+    # Listing timestamps commonly fall inside the exchange's first (partial)
+    # candle. Begin at the containing boundary so discovery does not skip it.
+    start_ms = floor_to_candle_boundary(interval, dt_to_ms(start_dt))
+    if min_start_ms is not None:
+        start_ms = max(start_ms, ceil_to_candle_boundary(interval, min_start_ms))
+
     if last_open_ms is None:
-        current_ms = dt_to_ms(start_dt)
+        current_ms = start_ms
+        discovering_first_candle = True
     else:
-        current_ms = last_open_ms + interval_ms
-    if min_start_ms is not None and current_ms < min_start_ms:
-        current_ms = min_start_ms
+        # Re-fetch the stored terminal candle so exchange revisions are applied.
+        current_ms = max(last_open_ms, start_ms)
+        discovering_first_candle = False
 
-    while True:
-        available_until_ms = utc_now_ms() - end_lag_ms
-        if current_ms + interval_ms > available_until_ms:
-            break
+    stage_id = writer.start_symbol_stage()
+    stage_finished = False
+    staged_rows = False
+    first_open_to_cache: int | None = None
+    complete_end_ms = settled_candle_end_ms(
+        interval,
+        utc_now_ms() - end_lag_ms,
+        settlement_delay_ms=settlement_delay_ms,
+    )
+    try:
+        while True:
+            if current_ms >= complete_end_ms:
+                break
 
-        end_ms = min(current_ms + interval_ms * batch_candles, available_until_ms)
-        try:
-            fetch_result = coerce_fetch_result(fetch_rows(symbol, current_ms, end_ms))
-        except Exception as exc:
-            print(
-                f"[WARN] Failed window for {symbol} "
-                f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)}: {exc}"
+            end_ms = min(
+                advance_candle_open_ms(current_ms, interval, batch_candles),
+                complete_end_ms,
             )
-            return False
+            try:
+                fetch_result = coerce_fetch_result(fetch_rows(symbol, current_ms, end_ms))
+            except Exception as exc:
+                print(
+                    f"[WARN] Failed window for {symbol} "
+                    f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)}: {exc}"
+                )
+                return False
 
-        if not fetch_result.succeeded:
-            print(
-                f"[WARN] Deferred failed window for {symbol} "
-                f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)} "
-                f"({fetch_result.status.value}): {fetch_result.message}"
+            if not fetch_result.succeeded:
+                print(
+                    f"[WARN] Deferred failed window for {symbol} "
+                    f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)} "
+                    f"({fetch_result.status.value}): {fetch_result.message}"
+                )
+                return False
+
+            if not fetch_result.rows:
+                if discovering_first_candle:
+                    current_ms = end_ms
+                    if sleep_between_calls > 0:
+                        time.sleep(sleep_between_calls)
+                    continue
+                print(
+                    f"[WARN] Deferred empty closed window for {symbol} "
+                    f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)}; "
+                    "the checkpoint was not advanced."
+                )
+                return False
+
+            was_discovering_first_candle = discovering_first_candle
+            try:
+                validation_start_ms = current_ms
+                if discovering_first_candle:
+                    candidate_rows = validate_raw_kline_rows(
+                        fetch_result.rows,
+                        symbol=symbol,
+                        interval=interval,
+                        start_ms=current_ms,
+                        end_ms=end_ms,
+                        require_full_window=False,
+                    )
+                    if not candidate_rows:
+                        current_ms = end_ms
+                        continue
+                    validation_start_ms = utc_string_to_ms(str(candidate_rows[0][0]))
+
+                output_rows = validate_raw_kline_rows(
+                    fetch_result.rows,
+                    symbol=symbol,
+                    interval=interval,
+                    start_ms=validation_start_ms,
+                    end_ms=end_ms,
+                    require_full_window=True,
+                )
+            except KlineValidationError as exc:
+                print(
+                    f"[WARN] Deferred invalid window for {symbol} "
+                    f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)}: {exc}"
+                )
+                return False
+
+            writer.stage_output_rows(stage_id, symbol, output_rows)
+            staged_rows = True
+            if was_discovering_first_candle:
+                first_open_to_cache = validation_start_ms
+            discovering_first_candle = False
+
+            current_ms = end_ms
+            if sleep_between_calls > 0:
+                time.sleep(sleep_between_calls)
+
+        if staged_rows:
+            writer.commit_symbol_stage(
+                stage_id,
+                symbol,
+                first_open_ms=first_open_to_cache,
             )
-            return False
-
-        malformed_row = next(
-            (
-                row
-                for row in fetch_result.rows
-                if len(row) < 6 or _coerce_raw_open_ms(row[0]) is None
-            ),
-            None,
-        )
-        if malformed_row is not None:
-            print(
-                f"[WARN] Deferred malformed window for {symbol} "
-                f"{ms_to_utc_string(current_ms)}..{ms_to_utc_string(end_ms)}: "
-                f"{malformed_row!r}"
-            )
-            return False
-
-        output_rows = build_output_rows(
-            fetch_result.rows,
-            interval_ms,
-            last_open_ms,
-            available_until_ms,
-        )
-        if output_rows:
-            append_output_rows(database_path, symbol, output_rows, writer=writer)
-            last_open_ms = utc_string_to_ms(str(output_rows[-1][0]))
-
-        current_ms = end_ms
-        if sleep_between_calls > 0:
-            time.sleep(sleep_between_calls)
-    return True
+        else:
+            writer.discard_symbol_stage(stage_id)
+        stage_finished = True
+        return True
+    finally:
+        if not stage_finished:
+            try:
+                writer.discard_symbol_stage(stage_id)
+            except Exception:
+                pass
 
 
 def _coerce_raw_open_ms(value: object) -> int | None:
@@ -1123,6 +1877,7 @@ def run_timeframe_collection(
     start_dt: datetime | Mapping[str, datetime] | Callable[[str], datetime] = DEFAULT_START_DT,
     batch_candles: int = BATCH_CANDLES,
     end_lag_ms: int = 0,
+    settlement_delay_ms: int = CANDLE_SETTLEMENT_DELAY_MS,
     min_start_ms: int | Mapping[str, int | None] | Callable[[str], int | None] | None = None,
     network_workers: int = COLLECTOR_NETWORK_WORKERS,
     write_queue_size: int = DATABASE_WRITE_QUEUE_SIZE,
@@ -1151,6 +1906,7 @@ def run_timeframe_collection(
                 batch_candles=batch_candles,
                 end_lag_ms=end_lag_ms,
                 min_start_ms=symbol_min_start_ms,
+                settlement_delay_ms=settlement_delay_ms,
                 writer=writer,
             )
 

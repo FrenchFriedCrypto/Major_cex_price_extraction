@@ -45,7 +45,7 @@ def fetch_klines(symbol: str, api_interval: str, start_ms: int, end_ms: int) -> 
     params = {
         "interval": api_interval,
         "start": start_ms // 1000,
-        "end": end_ms // 1000,
+        "end": (end_ms - 1) // 1000,
     }
     request_result = request_json_outcome(
         request_json,
